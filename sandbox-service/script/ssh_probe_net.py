@@ -2,7 +2,7 @@ import paramiko, json
 
 cli = paramiko.SSHClient()
 cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-cli.connect("<internal-host>", username="root", password="<redacted>", timeout=10)
+cli.connect(HOST, username=USER, password=PWD, timeout=10)
 
 CMDS = [
     ("baidu", "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 https://www.baidu.com || echo X"),

@@ -1,9 +1,6 @@
 """只读侦查：Docker 存储驱动现状 + 切换到 vfs/overlayfs 的影响面评估。"""
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-
-
 def run(cli, cmd, timeout=60):
     _, o, e = cli.exec_command(cmd, timeout=timeout)
     return o.read().decode("utf-8", "ignore"), e.read().decode("utf-8", "ignore")

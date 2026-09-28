@@ -1,9 +1,11 @@
 """通过控制面 API 删除残留沙箱登记，核对配额归零。"""
 import paramiko
+import os
+E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 
 cli = paramiko.SSHClient()
 cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-cli.connect("<internal-host>", username="root", password="<redacted>", timeout=10)
+cli.connect(HOST, username=USER, password=PWD, timeout=10)
 
 
 def run(cmd, timeout=60):
@@ -20,6 +22,6 @@ def run(cmd, timeout=60):
 
 
 for sid in ["sbx5e15694fca6a4c5cb", "sbxff0c2dc1540e422da"]:
-    run(f"curl -s -m 8 -X DELETE -H 'X-API-KEY: <e2b-key-redacted>' http://127.0.0.1:8902/sandboxes/{sid} -w '\\ncode=%{{http_code}}\\n'")
+    run(f"curl -s -m 8 -X DELETE -H f'X-API-KEY: {E2B_KEY}' http://127.0.0.1:8902/sandboxes/{sid} -w '\\ncode=%{{http_code}}\\n'")
 run("curl -s -m 5 http://127.0.0.1:8902/health")
 cli.close()

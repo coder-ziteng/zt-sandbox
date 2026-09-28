@@ -1,8 +1,6 @@
 """P2 probe #2: checkpoint round-trip using --checkpoint-dir (bypasses containerd content store)."""
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-
 CMD = r"""
 set -x
 mkdir -p /var/lib/sbx-checkpoints

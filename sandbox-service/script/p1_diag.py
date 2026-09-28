@@ -1,8 +1,6 @@
 """Diagnose P1 all-in-one sandbox creation failure."""
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-
 CMD = r"""
 echo "== free"; free -m | head -2
 echo "== containers"; docker ps -a --format '{{.Names}} {{.Status}}' | grep -E 'sbx|sandbox' | head -10

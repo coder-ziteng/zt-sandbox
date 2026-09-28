@@ -1,10 +1,12 @@
 import time
 
 import paramiko
+import os
+E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 
 cli = paramiko.SSHClient()
 cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-cli.connect("<internal-host>", username="root", password="<redacted>", timeout=10)
+cli.connect(HOST, username=USER, password=PWD, timeout=10)
 
 
 def run(cmd, timeout=60):
@@ -22,7 +24,7 @@ def run(cmd, timeout=60):
 
 time.sleep(8)  # 等控制面完全就绪
 run("curl -s -m 5 -w '\\nhealth_code=%{http_code}\\n' http://127.0.0.1:8902/health")
-run("curl -s -m 8 -H 'X-API-KEY: <e2b-key-redacted>' http://127.0.0.1:8902/sandboxes -w '\\nlist_code=%{http_code}\\n' | head -20")
+run("curl -s -m 8 -H f'X-API-KEY: {E2B_KEY}' http://127.0.0.1:8902/sandboxes -w '\\nlist_code=%{http_code}\\n' | head -20")
 run("curl -s -m 5 -o /dev/null -w 'proxy443_code=%{http_code}\\n' http://127.0.0.1:443/")
 run("ss -ltnp | grep -E ':8902|:443' | head -5")
 run("docker logs sandbox-control-plane --tail 5 2>&1")

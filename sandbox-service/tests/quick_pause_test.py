@@ -2,13 +2,14 @@
 import os, sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["SSL_CERT_FILE"] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "certs", "ca.pem")
-os.environ["E2B_API_URL"] = "http://<internal-host>:8902"
-os.environ["E2B_API_KEY"] = "<e2b-key-redacted>"
-os.environ["NO_PROXY"] = "<internal-host>,.nip.io,*.nip.io"
+os.environ["E2B_API_URL"] = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+os.environ["E2B_API_KEY"] = os.environ.get("SBX_E2B_KEY", "")
+os.environ["NO_PROXY"] = os.environ.get("SBX_NO_PROXY", "<internal-host>,.nip.io,*.nip.io")
 os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
+SBX_API_KEY = os.environ.get("SBX_API_KEY", "")
 import httpx
-API_HEADERS = {"Authorization": "Bearer <dev-key-redacted>"}
+API_HEADERS = {"Authorization": f"Bearer {SBX_API_KEY}"}
 OPTS = dict(api_url=os.environ["E2B_API_URL"], api_key=os.environ["E2B_API_KEY"],
             headers=API_HEADERS, request_timeout=60, timeout=300)
 

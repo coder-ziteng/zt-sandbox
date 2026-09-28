@@ -1,9 +1,9 @@
 """Inspect a live sandbox record + its published ports + in-container processes."""
 import paramiko, sys
+import os
+SBX_API_KEY = os.environ.get("SBX_API_KEY", "")
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-KEY = "<dev-key-redacted>"
-
+KEY = os.environ.get("SBX_API_KEY", "")
 CMD = r"""
 echo "== ports"; docker ps -a --format '{{.Names}} :: {{.Ports}}' | grep -E '^sbx-' | head -5
 echo "== sandbox json"; curl -s -m 5 http://127.0.0.1:8902/v2/sandboxes -H 'Authorization: Bearer %s' | head -c 1200; echo

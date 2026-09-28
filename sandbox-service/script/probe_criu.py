@@ -1,8 +1,6 @@
 """P2 probe: enable docker experimental + install CRIU + actually try a checkpoint round-trip."""
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-
 CMD = r"""
 set -x
 echo '{"experimental": true}' > /etc/docker/daemon.json

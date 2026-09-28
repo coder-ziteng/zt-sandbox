@@ -22,6 +22,9 @@ import sys
 import time
 
 import httpx
+import os
+SBX_API_KEY = os.environ.get("SBX_API_KEY", "")
+E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ["SSL_CERT_FILE"] = os.path.join(ROOT, "certs", "ca.pem")
@@ -30,9 +33,9 @@ for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"
 os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
 
-API = "http://<internal-host>:8902"
-KEY = "<dev-key-redacted>"
-DOMAIN = "<internal-host>.nip.io"
+API = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+KEY = os.environ.get("SBX_API_KEY", "")
+DOMAIN = os.environ.get("SBX_DOMAIN", "<internal-host>.nip.io")
 HEADERS = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 
 FAILS = []
@@ -132,7 +135,7 @@ PAGE_HTML = """<!doctype html><html><head><title>Session Test</title></head><bod
 def write_page(sbx, path="/home/user/workspace/page.html"):
     """写入测试页并在沙箱内起 http.server（cookies 需要 http origin）。"""
     from e2b_code_interpreter import Sandbox as CodeSandbox
-    cs = CodeSandbox.connect(sbx["sandboxID"], api_key="<e2b-key-redacted>",
+    cs = CodeSandbox.connect(sbx["sandboxID"], api_key=E2B_KEY,
                              api_url=API, domain=DOMAIN)
     cs.files.write(path, PAGE_HTML)
     cs.commands.run("python3 -m http.server 8000 --directory /home/user/workspace",

@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 法律法规数据库 - 部署脚本
-将项目部署到远程服务器 <internal-host>
+将项目部署到远程服务器。
+凭据从环境变量读取(参考 .env.example):REMOTE_HOST / REMOTE_USER / REMOTE_PASSWORD。
 """
+import os
 import sys
 import tarfile
 import subprocess
-import time
-from pathlib import Path
 import time
 from pathlib import Path
 
@@ -17,11 +17,19 @@ except ImportError:
     subprocess.run([sys.executable, "-m", "pip", "install", "paramiko", "-q"])
     import paramiko
 
-# 远程服务器配置
-REMOTE_HOST = "<internal-host>"
-REMOTE_USER = "root"
-REMOTE_PASSWORD = "<redacted>"
-REMOTE_PORT = 22
+
+def _require(name):
+    val = os.environ.get(name)
+    if not val:
+        sys.exit(f"[ERROR] env var {name!r} is required (see .env.example)")
+    return val
+
+
+# 远程服务器配置(凭据不写入仓库)
+REMOTE_HOST = _require("REMOTE_HOST")
+REMOTE_USER = _require("REMOTE_USER")
+REMOTE_PASSWORD = _require("REMOTE_PASSWORD")
+REMOTE_PORT = int(os.environ.get("REMOTE_PORT", "22"))
 
 # 项目路径
 PROJECT_DIR = Path(__file__).parent

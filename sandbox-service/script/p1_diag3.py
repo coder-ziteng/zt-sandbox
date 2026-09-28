@@ -1,8 +1,6 @@
 """Why isn't browser_svc running inside the sandbox container?"""
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-
 CMD = r"""
 n=$(docker ps -a --format '{{.Names}}' | grep -E '^sbx-' | head -1)
 echo "container=$n"

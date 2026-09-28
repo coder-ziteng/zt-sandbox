@@ -1,9 +1,11 @@
 """清理 162 上残留的沙箱实例（释放内存配额）。"""
 import paramiko
+import os
+E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 
 cli = paramiko.SSHClient()
 cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-cli.connect("<internal-host>", username="root", password="<redacted>", timeout=10)
+cli.connect(HOST, username=USER, password=PWD, timeout=10)
 
 
 def run(cmd, timeout=60):
@@ -19,7 +21,7 @@ def run(cmd, timeout=60):
     return out
 
 
-run("curl -s -m 8 -H 'X-API-KEY: <e2b-key-redacted>' http://127.0.0.1:8902/v2/sandboxes | head -c 2000")
+run("curl -s -m 8 -H f'X-API-KEY: {E2B_KEY}' http://127.0.0.1:8902/v2/sandboxes | head -c 2000")
 out = run("docker ps --filter name=sbx- --format '{{.Names}}'")
 names = [n for n in out.splitlines() if n.strip().startswith("sbx-")]
 for n in names:

@@ -19,7 +19,7 @@ import runtime
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("control-plane")
 
-API_KEYS = [k.strip() for k in os.getenv("API_KEYS", "<dev-key-redacted>").split(",") if k.strip()]
+API_KEYS = [k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip()]
 SANDBOX_DOMAIN = os.getenv("SANDBOX_DOMAIN", "<internal-host>.nip.io")
 ENVD_VERSION = "0.7.0"
 MAX_SANDBOXES = int(os.getenv("MAX_SANDBOXES", "24"))

@@ -1,7 +1,5 @@
 import paramiko, json
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-
 CMDS = [
     ("os", "cat /etc/os-release | head -5"),
     ("kernel", "uname -r"),

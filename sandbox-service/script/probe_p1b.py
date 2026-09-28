@@ -11,10 +11,12 @@ for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"
 os.environ["NO_PROXY"] = "*"
 
 import httpx
+E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
+SBX_API_KEY = os.environ.get("SBX_API_KEY", "")
 
-API = "http://<internal-host>:8902"
-DOMAIN = "<internal-host>.nip.io"
-HEADERS = {"Authorization": "Bearer <dev-key-redacted>", "Content-Type": "application/json"}
+API = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+DOMAIN = os.environ.get("SBX_DOMAIN", "<internal-host>.nip.io")
+HEADERS = {"Authorization": f"Bearer {SBX_API_KEY}", "Content-Type": "application/json"}
 
 PAGE = """<!doctype html><html><head><title>Probe</title></head><body>
 <h1 id="title">probe</h1><input id="q" value=""/>
@@ -36,7 +38,7 @@ def main():
     try:
         # 起 http server
         from e2b_code_interpreter import Sandbox as CodeSandbox
-        cs = CodeSandbox.connect(sid, api_key="<e2b-key-redacted>", api_url=API, domain=DOMAIN)
+        cs = CodeSandbox.connect(sid, api_key=E2B_KEY, api_url=API, domain=DOMAIN)
         cs.files.write("/home/user/workspace/page.html", PAGE)
         cs.commands.run("python3 -m http.server 8000 --directory /home/user/workspace", background=True)
         time.sleep(2)

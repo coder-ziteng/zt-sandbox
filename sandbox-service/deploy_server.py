@@ -8,19 +8,31 @@ import time
 
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
+
+def _require(name):
+    val = os.environ.get(name)
+    if not val:
+        sys.exit(f"[ERROR] env var {name!r} is required (see .env.example)")
+    return val
+
+
+HOST = _require("SBX_SSH_HOST")
+USER = _require("SBX_SSH_USER")
+PWD = _require("SBX_SSH_PASSWORD")
 LOCAL_ROOT = os.path.dirname(os.path.abspath(__file__))
 REMOTE_DIR = "/srv/sandbox-service"
-DOMAIN = "<internal-host>.nip.io"
-API_KEYS = "<dev-key-redacted>"
+DOMAIN = os.environ.get("SBX_DOMAIN", f"{HOST}.nip.io")
+API_KEYS = _require("SBX_API_KEYS")
+# Optional second key for the official e2b SDK (their client validates the key prefix).
+E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 
 SKIP_DIRS = {".venv", "__pycache__", "data", "certs"}
 SKIP_FILES = {".gitignore"}
 
-# e2b_ prefixed key: the official e2b SDK validates the key format client-side,
-# so our control plane must accept it too.
+# Write API_KEYS (+ optional e2b key) into the deployed container's .env
+api_keys_csv = API_KEYS + (f",{E2B_KEY}" if E2B_KEY else "")
 EXTRA = {
-    "deploy/.env": f"API_KEYS={API_KEYS},<e2b-key-redacted>\nSANDBOX_DOMAIN={DOMAIN}\n",
+    "deploy/.env": f"API_KEYS={api_keys_csv}\nSANDBOX_DOMAIN={DOMAIN}\n",
 }
 
 

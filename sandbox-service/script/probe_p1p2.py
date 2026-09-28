@@ -2,8 +2,6 @@
 import json
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-
 CMD = r"""
 echo "== os"; cat /etc/os-release | head -2
 echo "== cpu/mem"; nproc; free -m | head -2; df -h / | tail -1

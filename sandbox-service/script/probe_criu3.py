@@ -1,8 +1,6 @@
 """P2 probe #3: determine whether docker checkpoint restore works at all on this daemon."""
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-
 CMD = r"""
 set -x
 docker info --format 'driver={{.Driver}}'

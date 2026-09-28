@@ -1,9 +1,15 @@
+import os
 import paramiko
 import sys
 
 client = paramiko.SSHClient()
 client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-client.connect('<internal-host>', username='root', password='<redacted>', timeout=10)
+client.connect(
+    os.environ.get("REMOTE_HOST") or sys.exit("[ERROR] REMOTE_HOST is required"),
+    username=os.environ.get("REMOTE_USER") or sys.exit("[ERROR] REMOTE_USER is required"),
+    password=os.environ.get("REMOTE_PASSWORD") or sys.exit("[ERROR] REMOTE_PASSWORD is required"),
+    timeout=10,
+)
 
 def exec_cmd(cmd):
     stdin, stdout, stderr = client.exec_command(cmd)

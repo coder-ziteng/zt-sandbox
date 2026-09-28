@@ -3,10 +3,12 @@ import json
 import time
 
 import paramiko
+import os
+E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 
 cli = paramiko.SSHClient()
 cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-cli.connect("<internal-host>", username="root", password="<redacted>", timeout=10)
+cli.connect(HOST, username=USER, password=PWD, timeout=10)
 
 
 def run(cmd, timeout=60):
@@ -22,7 +24,7 @@ def run(cmd, timeout=60):
     return out
 
 
-H = "-H 'Content-Type: application/json' -H 'X-API-KEY: <e2b-key-redacted>'"
+H = "-H 'Content-Type: application/json' -H f'X-API-KEY: {E2B_KEY}'"
 # 1. create
 out = run(f"curl -s -m 30 -X POST {H} http://127.0.0.1:8902/sandboxes -d '{{\"templateID\":\"tmplc5dbfe8c710542378\",\"timeout\":600}}'")
 sb = None

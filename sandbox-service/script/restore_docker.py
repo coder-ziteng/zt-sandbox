@@ -3,7 +3,6 @@ import time
 
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
 cli = paramiko.SSHClient()
 cli.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 cli.connect(HOST, username=USER, password=PWD, timeout=10)

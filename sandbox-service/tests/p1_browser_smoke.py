@@ -14,6 +14,9 @@ import sys
 import time
 
 import httpx
+import os
+SBX_API_KEY = os.environ.get("SBX_API_KEY", "")
+E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ["SSL_CERT_FILE"] = os.path.join(ROOT, "certs", "ca.pem")
@@ -25,9 +28,9 @@ for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"
 os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
 
-API = "http://<internal-host>:8902"
-KEY = "<dev-key-redacted>"
-DOMAIN = "<internal-host>.nip.io"
+API = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+KEY = os.environ.get("SBX_API_KEY", "")
+DOMAIN = os.environ.get("SBX_DOMAIN", "<internal-host>.nip.io")
 HEADERS = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 
 FAILS = []
@@ -145,7 +148,7 @@ def main():
     # ---------- 5. code interpreter parity (all-in-one) ----------
     if "jupyter" in (sbx.get("features") or ""):
         from e2b_code_interpreter import Sandbox as CodeSandbox
-        cs = CodeSandbox.connect(sid, api_url=API, api_key="<e2b-key-redacted>", domain=DOMAIN)
+        cs = CodeSandbox.connect(sid, api_url=API, api_key=E2B_KEY, domain=DOMAIN)
         res = cs.run_code("import sys; print('py', sys.version_info.minor)")
         text = "".join(o if isinstance(o, str) else o.text for o in (res.logs.stdout or []))
         check("run_code works on all-in-one", "py" in text, text.strip())

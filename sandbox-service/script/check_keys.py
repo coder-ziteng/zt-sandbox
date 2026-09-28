@@ -1,14 +1,16 @@
 """Verify API_KEYS actually reached the control-plane container."""
-import paramiko, json
+import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
-CMD = r"""
+from deploy_server import API_KEYS, HOST, PWD, USER
+
+# Pick the first key from the comma-separated list to test against.
+_SK_KEY = API_KEYS.split(",")[0].strip()
+CMD = f"""
 cat /srv/sandbox-service/deploy/.env
 echo "---"
 docker exec sandbox-control-plane env | grep API_KEYS
 echo "--- direct auth test"
-curl -s -o /dev/null -w 'sk-key:%{http_code}\n' http://127.0.0.1:8902/v2/templates -H 'Authorization: Bearer <dev-key-redacted>'
-curl -s -o /dev/null -w 'e2b-key:%{http_code}\n' http://127.0.0.1:8902/v2/templates -H 'Authorization: Bearer <e2b-key-redacted>'
+curl -s -o /dev/null -w 'sk-key:%{{http_code}}\\n' http://127.0.0.1:8902/v2/templates -H 'Authorization: Bearer {_SK_KEY}'
 """
 
 cli = paramiko.SSHClient()

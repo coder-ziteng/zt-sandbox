@@ -1,4 +1,6 @@
-"""upgrade_docker.py -- 将 <internal-host> 上的 Docker 从 29.5.2 升级到最新 29.x
+"""upgrade_docker.py -- 将沙箱主机上的 Docker 升级到最新 29.x
+
+凭据从 deploy_server.py 读取(由环境变量 SBX_SSH_HOST/USER/PASSWORD 提供)。
 
 步骤:
 1. dnf upgrade docker-ce + containerd.io + runc + docker-buildx-plugin
@@ -13,11 +15,8 @@ import time
 
 import paramiko
 
-HOST, USER, PWD = "<internal-host>", "root", "123456"
+from deploy_server import API_KEYS, HOST, PWD, USER
 REMOTE_DIR = "/srv/sandbox-service"
-
-sys.path.insert(0, ".")
-from deploy_server import API_KEYS
 
 
 def ssh_connect():

@@ -10,15 +10,17 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import httpx
+SBX_API_KEY = os.environ.get("SBX_API_KEY", "")
+E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ["SSL_CERT_FILE"] = os.path.join(ROOT, "certs", "ca.pem")
-os.environ["NO_PROXY"] = "<internal-host>,<internal-host>.nip.io"
-os.environ["E2B_API_URL"] = "http://<internal-host>:8902"
-os.environ["E2B_API_KEY"] = "<e2b-key-redacted>"  # SDK validates the e2b_ prefix client-side
+os.environ["NO_PROXY"] = os.environ.get("SBX_NO_PROXY", "<internal-host>,<internal-host>.nip.io")
+os.environ["E2B_API_URL"] = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+os.environ["E2B_API_KEY"] = os.environ.get("SBX_E2B_KEY", "")  # SDK validates the e2b_ prefix client-side
 
-API = "http://<internal-host>:8902"
-KEY = "<dev-key-redacted>"
+API = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+KEY = os.environ.get("SBX_API_KEY", "")
 HEADERS = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 
 FAILS = []
@@ -55,7 +57,7 @@ def kill(sid):
 
 def sdk_connect(sid):
     from e2b_code_interpreter import Sandbox as CodeSandbox
-    return CodeSandbox.connect(sid, api_url=API, api_key="<e2b-key-redacted>")
+    return CodeSandbox.connect(sid, api_url=API, api_key=E2B_KEY)
 
 
 # ---------------- P2.1 network allowlist ----------------
