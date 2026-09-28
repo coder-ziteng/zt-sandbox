@@ -84,7 +84,7 @@ fresh kernel after stop/start ✅
 
 ### 测试环境
 
-- 服务器：<internal-host>
+- 服务器：${SBX_SSH_HOST}
 - 沙箱镜像：`sandbox/browser:v1`（Chromium 154）
 - 测试脚本：`tests/p1b_session_smoke.py`
 
@@ -252,5 +252,5 @@ fresh kernel after stop/start ✅
 ---
 
 **报告生成时间**：2026-09-27 19:30  
-**测试环境**：Windows 11 开发机 → Linux 服务器 <internal-host>  
+**测试环境**：Windows 11 开发机 → Linux 服务器 ${SBX_SSH_HOST}  
 **文档位置**：`sandbox-service/README.md`（418 行）

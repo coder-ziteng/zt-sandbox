@@ -2,7 +2,7 @@
 
 > 版本 v2.0 ｜ 2026-09-27 ｜ 决策：独立 Linux 服务器部署 · 兼容 E2B 协议 · 一期代码解释器先行
 >
-> **状态：P0 / P1 / P2 全部交付并通过端到端冒烟**（服务器 <internal-host>）
+> **状态：P0 / P1 / P2 全部交付并通过端到端冒烟**（服务器 ${SBX_SSH_HOST}）
 
 ## 1. 目标
 
@@ -162,7 +162,7 @@ sandbox-service/
 ```python
 from playwright.sync_api import sync_playwright
 with sync_playwright() as p:
-    browser = p.chromium.connect_over_cdp("wss://3000-<sandboxID>.<internal-host>.nip.io/devtools/browser/<id>")
+    browser = p.chromium.connect_over_cdp("wss://3000-<sandboxID>.${SBX_DOMAIN}/devtools/browser/<id>")
 ```
 
 ### 健康检查

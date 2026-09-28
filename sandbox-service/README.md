@@ -16,17 +16,17 @@
 
 | 项 | 值 |
 |---|---|
-| 服务器 | `<internal-host>`（内网 Linux，root / 123456） |
-| 管控面 | `http://<internal-host>:8902`（HTTP） |
-| 边缘代理 | `https://*.{sandboxID}.<internal-host>.nip.io`（TLS，自签 CA） |
-| 管控面 API Key | `<dev-key-redacted>`（REST 用，放 `Authorization: Bearer ...`） |
-| SDK API Key | `<e2b-key-redacted>`（官方 e2b SDK 用，放 `X-API-KEY` 或 `api_key=`） |
+| 服务器 | `${SBX_SSH_HOST}`（内网 Linux，root / 123456） |
+| 管控面 | `http://${SBX_SSH_HOST}:8902`（HTTP） |
+| 边缘代理 | `https://*.{sandboxID}.${SBX_DOMAIN}`（TLS，自签 CA） |
+| 管控面 API Key | `${SBX_API_KEY}`（REST 用，放 `Authorization: Bearer ...`） |
+| SDK API Key | `${SBX_E2B_KEY}`（官方 e2b SDK 用，放 `X-API-KEY` 或 `api_key=`） |
 | CA 证书（客户端） | 本机 `sandbox-service/certs/ca.pem`，部署脚本会自动下载 |
 | 工作目录 | 本机 `E:\work\zt-Sandbox\sandbox-service` |
 | 远程目录 | 服务器 `/srv/sandbox-service` |
 
 **鉴权双通道**：管控面同时认 `Authorization: Bearer <key>` 和 `X-API-KEY: <key>` 两种 header。
-官方 e2b SDK 只会发后者，所以两个都要支持。`API_KEYS` 环境变量是逗号分隔的列表，目前配的是 `<dev-key-redacted>,<e2b-key-redacted>`。
+官方 e2b SDK 只会发后者，所以两个都要支持。`API_KEYS` 环境变量是逗号分隔的列表，目前配的是 `${SBX_API_KEY},${SBX_E2B_KEY}`。
 
 ---
 
@@ -39,9 +39,9 @@
 ```python
 from e2b_code_interpreter import Sandbox
 sbx = Sandbox.create(
-    api_url="http://<internal-host>:8902",
-    api_key="<e2b-key-redacted>",
-    domain="<internal-host>.nip.io",
+    api_url="http://${SBX_SSH_HOST}:8902",
+    api_key="${SBX_E2B_KEY}",
+    domain="${SBX_DOMAIN}",
 )
 sbx.run_code("print(1+1)")
 ```
@@ -65,7 +65,7 @@ sbx.run_code("print(1+1)")
 
 1. **管控面 / 数据面分离**：管控面只管创建/销毁/元数据；拿到 `host + token` 后你的 SDK **直接连容器**，管控面不做数据面代理。跟百炼 / E2B 一致。
 2. **自研 mini_envd 替代 E2B 的 envd**：E2B 开源的 envd 是 Go 写的，我们不依赖它，用 Python + FastAPI 重写了相同的 ConnectRPC 接口（`/process.Process/...`、`/filesystem.Filesystem/...`、`/files`）。SDK 完全无感知。
-3. **边缘代理按 host header 路由**：`https://3000-{sandboxID}.<internal-host>.nip.io/...` → 查 SQLite 找 host 端口 → 转发到 `127.0.0.1:{hostPort}`。WebSocket 升级也支持（Playwright 通过 CDP 直连浏览器就靠它）。
+3. **边缘代理按 host header 路由**：`https://3000-{sandboxID}.${SBX_DOMAIN}/...` → 查 SQLite 找 host 端口 → 转发到 `127.0.0.1:{hostPort}`。WebSocket 升级也支持（Playwright 通过 CDP 直连浏览器就靠它）。
 
 ---
 
@@ -96,9 +96,9 @@ sbx.run_code("print(1+1)")
 from e2b_code_interpreter import Sandbox
 
 sbx = Sandbox.create(
-    api_url="http://<internal-host>:8902",
-    api_key="<e2b-key-redacted>",
-    domain="<internal-host>.nip.io",
+    api_url="http://${SBX_SSH_HOST}:8902",
+    api_key="${SBX_E2B_KEY}",
+    domain="${SBX_DOMAIN}",
     timeout=600,  # 秒
 )
 print(sbx.sandbox_id)
@@ -130,15 +130,15 @@ sbx = Sandbox.create(...)
 sbx.commands.run("echo first")
 
 # 暂停（默认走 CRIU，如果不可用会自动降级到 docker stop）
-sbx.beta_pause(api_url=..., api_key=..., headers={"Authorization": "Bearer <dev-key-redacted>"})
+sbx.beta_pause(api_url=..., api_key=..., headers={"Authorization": "Bearer ${SBX_API_KEY}"})
 
 # 恢复
 Sandbox._cls_resume(sandbox_id=sbx.sandbox_id, ...)
 sbx2 = Sandbox.connect(sandbox_id=sbx.sandbox_id, ...)
 
 # 检查用了哪种模式
-info = httpx.get(f"http://<internal-host>:8902/sandboxes/{sbx.sandbox_id}",
-                 headers={"Authorization": "Bearer <dev-key-redacted>"}).json()
+info = httpx.get(f"http://${SBX_SSH_HOST}:8902/sandboxes/{sbx.sandbox_id}",
+                 headers={"Authorization": "Bearer ${SBX_API_KEY}"}).json()
 print(info["pauseMode"])  # "criu" 或 "stop"
 ```
 
@@ -155,9 +155,9 @@ print(info["pauseMode"])  # "criu" 或 "stop"
 ```python
 import httpx
 
-API = "http://<internal-host>:8902"
-KEY = "<dev-key-redacted>"
-DOMAIN = "<internal-host>.nip.io"
+API = "http://${SBX_SSH_HOST}:8902"
+KEY = "${SBX_API_KEY}"
+DOMAIN = "${SBX_DOMAIN}"
 H = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 
 # 1. 创建带浏览器的沙箱
@@ -274,8 +274,8 @@ cap = httpx.get(f"{API}/health", headers=H).json()
 
 ```python
 from e2b_code_interpreter import Sandbox
-sbx = Sandbox.create(api_url="http://<internal-host>:8902",
-                     api_key="<e2b-key-redacted>", domain="<internal-host>.nip.io")
+sbx = Sandbox.create(api_url="http://${SBX_SSH_HOST}:8902",
+                     api_key="${SBX_E2B_KEY}", domain="${SBX_DOMAIN}")
 
 # 读文件（返回字符串）
 content = sbx.files.read("/home/user/workspace/output.csv")
@@ -296,9 +296,9 @@ sbx.kill()
 
 ```python
 import httpx
-API = "http://<internal-host>:8902"
-DOMAIN = "<internal-host>.nip.io"
-H = {"Authorization": "Bearer <dev-key-redacted>"}
+API = "http://${SBX_SSH_HOST}:8902"
+DOMAIN = "${SBX_DOMAIN}"
+H = {"Authorization": "Bearer ${SBX_API_KEY}"}
 
 # 创建沙箱
 sbx = httpx.post(f"{API}/sandboxes", headers=H,
@@ -328,7 +328,7 @@ httpx.delete(f"{API}/sandboxes/{sid}", headers=H)
 **方式 C：运维提取（沙箱还活着时）**
 
 ```bash
-ssh root@<internal-host>
+ssh root@${SBX_SSH_HOST}
 docker cp sbx-{sandboxID}:/home/user/workspace/output.csv ./output.csv
 ```
 
@@ -352,7 +352,7 @@ docker cp sbx-{sandboxID}:/home/user/workspace/output.csv ./output.csv
 
 ## 6. 测试套件
 
-所有测试跑在 Windows 开发机（`e:\work\zt-Sandbox\sandbox-service`），对服务器 <internal-host> 发请求。
+所有测试跑在 Windows 开发机（`e:\work\zt-Sandbox\sandbox-service`），对服务器 ${SBX_SSH_HOST} 发请求。
 
 | 测试 | 文件 | 用途 |
 |---|---|---|
@@ -446,14 +446,14 @@ Docker 29 默认开 containerd snapshotter，会撞 CRIU 恢复时的 content-st
 
 **管控面起不来**
 ```bash
-ssh root@<internal-host>
+ssh root@${SBX_SSH_HOST}
 docker logs sandbox-control-plane --tail 50
 ```
 
 **沙箱创建失败，报端口耗尽**
 - `MAX_SANDBOXES=24`，`MAX_MEMORY_MB=6144`
-- 看一下 `http://<internal-host>:8902/health` 的 `capacity.used`
-- 手动清理：`curl -X GET http://<internal-host>:8902/v2/sandboxes -H 'Authorization: Bearer <dev-key-redacted>'` 然后逐个 `DELETE /sandboxes/{id}`
+- 看一下 `http://${SBX_SSH_HOST}:8902/health` 的 `capacity.used`
+- 手动清理：`curl -X GET http://${SBX_SSH_HOST}:8902/v2/sandboxes -H 'Authorization: Bearer ${SBX_API_KEY}'` 然后逐个 `DELETE /sandboxes/{id}`
 
 **浏览器连不上 / cdpReady=false**
 - 等 60 秒再试，Chromium 启动慢
