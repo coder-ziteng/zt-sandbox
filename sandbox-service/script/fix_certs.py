@@ -11,7 +11,7 @@ def run(cmd, timeout=60):
     if e.strip():
         print("STDERR:", e[-600:])
 
-D = "<internal-host>.nip.io"
+D = "192.168.2.162.nip.io"
 run(f"cd /srv/sandbox-service && rm -f certs/* && "
     f"printf 'basicConstraints=critical,CA:TRUE\\nkeyUsage=critical,keyCertSign,cRLSign\\nsubjectKeyIdentifier=hash\\n' > certs/ca.ext && "
     f"printf '[req]\\ndistinguished_name=dn\\nx509_extensions=v3_ca\\nprompt=no\\n[dn]\\nCN=sandbox-dev-ca\\n[v3_ca]\\nbasicConstraints=critical,CA:TRUE\\nkeyUsage=critical,keyCertSign,cRLSign\\nsubjectKeyIdentifier=hash\\n' > certs/ca.cnf && "

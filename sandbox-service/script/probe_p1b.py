@@ -14,8 +14,8 @@ import httpx
 E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 SBX_API_KEY = os.environ.get("SBX_API_KEY", "")
 
-API = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
-DOMAIN = os.environ.get("SBX_DOMAIN", "<internal-host>.nip.io")
+API = os.environ.get("SBX_API_URL", "http://192.168.2.162:8902")
+DOMAIN = os.environ.get("SBX_DOMAIN", "192.168.2.162.nip.io")
 HEADERS = {"Authorization": f"Bearer {SBX_API_KEY}", "Content-Type": "application/json"}
 
 PAGE = """<!doctype html><html><head><title>Probe</title></head><body>

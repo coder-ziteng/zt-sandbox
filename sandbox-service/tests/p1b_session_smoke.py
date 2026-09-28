@@ -33,9 +33,9 @@ for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "ALL_PROXY"
 os.environ["NO_PROXY"] = "*"
 os.environ["no_proxy"] = "*"
 
-API = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+API = os.environ.get("SBX_API_URL", "http://192.168.2.162:8902")
 KEY = os.environ.get("SBX_API_KEY", "")
-DOMAIN = os.environ.get("SBX_DOMAIN", "<internal-host>.nip.io")
+DOMAIN = os.environ.get("SBX_DOMAIN", "192.168.2.162.nip.io")
 HEADERS = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 
 FAILS = []

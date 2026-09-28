@@ -15,11 +15,11 @@ E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 os.environ["SSL_CERT_FILE"] = os.path.join(ROOT, "certs", "ca.pem")
-os.environ["NO_PROXY"] = os.environ.get("SBX_NO_PROXY", "<internal-host>,<internal-host>.nip.io")
-os.environ["E2B_API_URL"] = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+os.environ["NO_PROXY"] = os.environ.get("SBX_NO_PROXY", "192.168.2.162,192.168.2.162.nip.io")
+os.environ["E2B_API_URL"] = os.environ.get("SBX_API_URL", "http://192.168.2.162:8902")
 os.environ["E2B_API_KEY"] = os.environ.get("SBX_E2B_KEY", "")  # SDK validates the e2b_ prefix client-side
 
-API = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+API = os.environ.get("SBX_API_URL", "http://192.168.2.162:8902")
 KEY = os.environ.get("SBX_API_KEY", "")
 HEADERS = {"Authorization": f"Bearer {KEY}", "Content-Type": "application/json"}
 

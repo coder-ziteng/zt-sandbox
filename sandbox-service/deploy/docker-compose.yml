@@ -9,7 +9,7 @@ services:
       - NET_ADMIN
     environment:
       API_KEYS: "${API_KEYS:-}"
-      SANDBOX_DOMAIN: "${SANDBOX_DOMAIN:-<internal-host>.nip.io}"
+      SANDBOX_DOMAIN: "${SANDBOX_DOMAIN:-192.168.2.162.nip.io}"
       CRIU_ENABLED: "${CRIU_ENABLED:-auto}"
       CHECKPOINT_DIR: "/var/lib/sbx-checkpoints"
       MAX_SANDBOXES: "${MAX_SANDBOXES:-24}"

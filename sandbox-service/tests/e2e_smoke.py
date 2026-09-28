@@ -4,9 +4,9 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["SSL_CERT_FILE"] = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "certs", "ca.pem")
-os.environ["E2B_API_URL"] = os.environ.get("SBX_API_URL", "http://<internal-host>:8902")
+os.environ["E2B_API_URL"] = os.environ.get("SBX_API_URL", "http://192.168.2.162:8902")
 os.environ["E2B_API_KEY"] = os.environ.get("SBX_E2B_KEY", "")
-os.environ["NO_PROXY"] = os.environ.get("SBX_NO_PROXY", "<internal-host>,.nip.io,*.nip.io")
+os.environ["NO_PROXY"] = os.environ.get("SBX_NO_PROXY", "192.168.2.162,.nip.io,*.nip.io")
 os.environ["no_proxy"] = os.environ["NO_PROXY"]
 
 SBX_API_KEY = os.environ.get("SBX_API_KEY", "")
@@ -21,7 +21,7 @@ OPTS = dict(
 
 import httpx
 
-resp = httpx.get("http://<internal-host>:8902/v2/templates", headers=API_HEADERS, timeout=10)
+resp = httpx.get("http://192.168.2.162:8902/v2/templates", headers=API_HEADERS, timeout=10)
 tpl_codes = [t.get("templateCode") for t in resp.json()]
 print("templates:", tpl_codes)
 TEMPLATE = os.environ.get("SBX_TEMPLATE") or (tpl_codes[0] if tpl_codes else "code-interpreter-v1")
