@@ -40,3 +40,6 @@ certs/
 # Local recovery artifacts
 _recover_check.txt
 tasks_final_status.md
+
+# Local-only deploy helper (kept on disk for the agent to reference, not part of the project)
+deploy-demo/
