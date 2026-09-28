@@ -1,0 +1,35 @@
+services:
+  control-plane:
+    image: sandbox/control-plane:v1
+    container_name: sandbox-control-plane
+    network_mode: host
+    restart: unless-stopped
+    # NET_ADMIN: required by the P2 network allowlist (iptables runs in the host netns)
+    cap_add:
+      - NET_ADMIN
+    environment:
+      API_KEYS: "${API_KEYS:-<dev-key-redacted>}"
+      SANDBOX_DOMAIN: "${SANDBOX_DOMAIN:-<internal-host>.nip.io}"
+      CRIU_ENABLED: "${CRIU_ENABLED:-auto}"
+      CHECKPOINT_DIR: "/var/lib/sbx-checkpoints"
+      MAX_SANDBOXES: "${MAX_SANDBOXES:-24}"
+      MAX_MEMORY_MB: "${MAX_MEMORY_MB:-6144}"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ../data:/data
+      - ..:/src:ro
+      - /var/lib/sbx-checkpoints:/var/lib/sbx-checkpoints
+    command: sh -c "cd /src/server && python -m uvicorn main:app --host 0.0.0.0 --port 8902"
+
+  edge-proxy:
+    image: sandbox/control-plane:v1
+    container_name: sandbox-edge-proxy
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      CERT_DIR: /certs
+    volumes:
+      - ../data:/data
+      - ../certs:/certs:ro
+      - ..:/src:ro
+    command: python /src/server/proxy.py

@@ -1,0 +1,41 @@
+# IntelliJ / IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# Build outputs
+target/
+build/
+dist/
+
+# Python bytecode
+__pycache__/
+*.py[oc]
+
+# Logs (project-specific)
+sandbox-service/log/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+
+# Claude / IDE
+.claude/
+.workbuddy/
+
+# Certificates / keys (do not commit private material)
+certs/
+*.pem
+*.key
+
+# Local recovery artifacts
+_recover_check.txt
