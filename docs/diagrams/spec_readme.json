@@ -1,0 +1,71 @@
+{
+  "diagrams": [
+    {
+      "file": "Chat会话生命周期_泳道图.png",
+      "type": "swimlane",
+      "title": "Chat 会话 · 生命周期泳道图",
+      "desc": "POST /sandboxes(sessionId) → :443 复用 → DELETE；X-Session-Id 在控制面与 Edge Proxy 双层校验",
+      "lanes": ["Chat 平台", "控制面 :8902", "Docker", "Edge Proxy", "envd"],
+      "steps": [
+        [0, "新建会话"],
+        [1, "创建沙箱"],
+        [2, "起容器"],
+        [1, "落库+201"],
+        [0, "多轮对话"],
+        [3, "Session校验"],
+        [4, "envd响应"],
+        [0, "会话结束"],
+        [2, "删容器"],
+        [1, "清理+204"]
+      ]
+    },
+    {
+      "file": "数据面鉴权链_业务流程图.png",
+      "type": "flow",
+      "title": "数据面 · 鉴权决策流程图",
+      "desc": "两侧均无 key → 401(100001)；X-Session-Id 不匹配 → 403(100013)；/admin/* 与 /health·/metrics·/internal/* 走独立链路",
+      "rows": [
+        ["请求到达 :8902"],
+        ["Authorization / X-API-KEY"],
+        ["?DB 命中 key？"],
+        ["owner/tenant ← DB 行", "回退 API_KEYS env"],
+        ["?沙箱绑定 session？"],
+        ["X-Session-Id\n匹配校验", "legacy 直接放行"],
+        ["进入业务 handler"]
+      ]
+    },
+    {
+      "file": "keepalive自动唤醒_时序图.png",
+      "type": "sequence",
+      "title": "paused 沙箱 · 入站自动唤醒时序图",
+      "desc": "客户端无感：首连慢 1-3s（CRIU 还原），之后毫秒级",
+      "actors": ["客户端", "Edge Proxy", "控制面", "Docker", "SQLite"],
+      "messages": [
+        [0, 1, "HTTPS 请求 :443", "call"],
+        [1, 4, "查询端口映射", "call"],
+        [4, 1, "host_port", "return"],
+        [1, 1, "连接被拒(已停)", "self"],
+        [1, 2, "POST /internal/auto-resume", "call"],
+        [2, 4, "查 state 行", "call"],
+        [2, 3, "CRIU restore / start", "call"],
+        [3, 2, "container running", "return"],
+        [2, 4, "更新 state=running", "call"],
+        [2, 1, "200 {ok}", "return"],
+        [1, 1, "retry + pipe 透传", "self"],
+        [1, 0, "200 + body", "return"]
+      ]
+    },
+    {
+      "file": "沙箱状态机_分组图.png",
+      "type": "grouped",
+      "title": "沙箱生命周期 · 状态机",
+      "desc": "killed 行被直接 DELETE，不是实际存储的状态值",
+      "items": [
+        "running：创建即进入；/refreshes、/timeout 延长 TTL",
+        "paused：/pause → CRIU 快照或 docker stop",
+        "唤醒：/resume、/connect 或 Edge Proxy 入站自动唤醒",
+        "killed：TTL 到期或 DELETE → 容器与端口回收"
+      ]
+    }
+  ]
+}
