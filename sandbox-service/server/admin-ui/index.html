@@ -134,6 +134,22 @@
         <div class="skeleton sk-row"></div><div class="skeleton sk-row"></div>
       </div>
     </section>
+
+    <!-- Key 申请审批 -->
+    <section class="tile glass span-12" aria-labelledby="t-kreq">
+      <div class="tile-head">
+        <svg viewBox="0 0 24 24" class="ico accent"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="M9 14l2 2 4-4"/></svg>
+        <h2 id="t-kreq">Key 申请审批</h2>
+        <span class="tag pending-badge" id="kreq-pending" hidden></span>
+        <button class="btn btn-ghost btn-sm" id="kreq-refresh" title="刷新">
+          <svg viewBox="0 0 24 24" class="ico"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        </button>
+      </div>
+      <p class="tile-note">第三方经 POST /keys/requests 提交的申请 — 批准后才签发 Key，明文由申请人凭 ticket 一次性领取，面板不经手明文</p>
+      <div id="kreq-list" class="list" aria-live="polite">
+        <div class="skeleton sk-row"></div><div class="skeleton sk-row"></div>
+      </div>
+    </section>
   </main>
 </section>
 

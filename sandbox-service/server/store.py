@@ -91,6 +91,29 @@ def _ensure_api_keys(c):
     )
 
 
+def _ensure_key_requests(c):
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS key_requests (
+            id TEXT PRIMARY KEY,
+            ticket_hash TEXT NOT NULL,
+            applicant TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            tenant TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            note TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'pending',
+            issued_key_id TEXT,
+            issued_key_plain TEXT,
+            reject_reason TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            decided_at REAL,
+            retrieved_at REAL
+        )
+        """
+    )
+
+
 def init_db():
     with db() as c:
         c.executescript(
@@ -135,6 +158,7 @@ def init_db():
         )
         _migrate(c)
         _ensure_api_keys(c)
+        _ensure_key_requests(c)
 
 
 def new_id(prefix: str) -> str:
@@ -462,3 +486,137 @@ def resolve_key(plaintext: str) -> tuple[str, str] | None:
             c.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (time.time(), row["id"]))
             return row["owner"], row["tenant"]
     return None
+
+
+# ---------- key_requests (P4 self-service approval flow) ----------
+
+KEY_REQUEST_COLUMNS = (
+    "id, ticket_hash, applicant, owner, tenant, label, note, status, "
+    "issued_key_id, reject_reason, created_at, decided_at"
+)
+
+
+def _key_request_row(r) -> dict:
+    """Public shape — never includes ticket_hash or issued_key_plain."""
+    return {
+        "requestID": r["id"],
+        "applicant": r["applicant"],
+        "owner": r["owner"],
+        "tenant": r["tenant"],
+        "label": r["label"],
+        "note": r["note"],
+        "status": r["status"],
+        "issuedKeyID": r["issued_key_id"],
+        "rejectReason": r["reject_reason"],
+        "createdAt": int(r["created_at"]),
+        "decidedAt": int(r["decided_at"]) if r["decided_at"] else None,
+    }
+
+
+def create_key_request(applicant: str, owner: str, tenant: str, label: str,
+                       note: str, ticket_plain: str) -> str:
+    rid = new_id("kreq")
+    with db() as c:
+        c.execute(
+            "INSERT INTO key_requests (id,ticket_hash,applicant,owner,tenant,label,note,status,created_at) "
+            "VALUES (?,?,?,?,?,?,?,'pending',?)",
+            (rid, _hash_key(ticket_plain), applicant, owner, tenant, label, note, time.time()),
+        )
+    return rid
+
+
+def get_key_request(rid: str):
+    with db() as c:
+        row = c.execute(f"SELECT {KEY_REQUEST_COLUMNS} FROM key_requests WHERE id=?", (rid,)).fetchone()
+    return _key_request_row(row) if row else None
+
+
+def list_key_requests(status: str | None = None) -> list[dict]:
+    with db() as c:
+        if status:
+            rows = c.execute(
+                f"SELECT {KEY_REQUEST_COLUMNS} FROM key_requests WHERE status=? ORDER BY created_at DESC",
+                (status,),
+            ).fetchall()
+        else:
+            rows = c.execute(
+                f"SELECT {KEY_REQUEST_COLUMNS} FROM key_requests ORDER BY created_at DESC"
+            ).fetchall()
+    return [_key_request_row(r) for r in rows]
+
+
+def pending_count_for_owner(owner: str) -> int:
+    with db() as c:
+        return c.execute(
+            "SELECT COUNT(*) AS n FROM key_requests WHERE owner=? AND status='pending'", (owner,)
+        ).fetchone()["n"]
+
+
+def verify_request_ticket(rid: str, ticket_plain: str) -> bool:
+    """True when the ticket hashes to the stored ticket_hash for this request."""
+    if not ticket_plain:
+        return False
+    h = _hash_key(ticket_plain)
+    with db() as c:
+        row = c.execute(
+            "SELECT 1 FROM key_requests WHERE id=? AND ticket_hash=?", (rid, h)
+        ).fetchone()
+    return row is not None
+
+
+def approve_key_request(rid: str, key_id: str, plaintext: str,
+                        owner: str | None = None, tenant: str | None = None,
+                        label: str | None = None) -> bool:
+    """Transition pending -> approved and stage the minted key for one-time claim.
+
+    issued_key_plain is a temporary outbox: plaintext lives here only between
+    approve and claim (cleared on claim), matching how sandboxes store envd_token.
+    """
+    sets = ["status='approved'", "issued_key_id=?", "issued_key_plain=?", "decided_at=?"]
+    vals: list = [key_id, plaintext, time.time()]
+    if owner is not None:
+        sets.append("owner=?"); vals.append(owner)
+    if tenant is not None:
+        sets.append("tenant=?"); vals.append(tenant)
+    if label is not None:
+        sets.append("label=?"); vals.append(label)
+    vals.append(rid)
+    with db() as c:
+        cur = c.execute(
+            f"UPDATE key_requests SET {','.join(sets)} WHERE id=? AND status='pending'", vals
+        )
+    return cur.rowcount > 0
+
+
+def reject_key_request(rid: str, reason: str) -> bool:
+    with db() as c:
+        cur = c.execute(
+            "UPDATE key_requests SET status='rejected', reject_reason=?, decided_at=? "
+            "WHERE id=? AND status='pending'",
+            (reason, time.time(), rid),
+        )
+    return cur.rowcount > 0
+
+
+def claim_key_request(rid: str) -> str | None:
+    """Atomically take the staged plaintext (clears outbox, marks retrieved)."""
+    with db() as c:
+        row = c.execute(
+            "SELECT issued_key_plain FROM key_requests WHERE id=? AND status='approved'", (rid,)
+        ).fetchone()
+        if not row or not row["issued_key_plain"]:
+            return None
+        c.execute(
+            "UPDATE key_requests SET issued_key_plain='', retrieved_at=? WHERE id=?",
+            (time.time(), rid),
+        )
+    return row["issued_key_plain"]
+
+
+def cancel_key_request(rid: str) -> bool:
+    with db() as c:
+        cur = c.execute(
+            "UPDATE key_requests SET status='cancelled', decided_at=? WHERE id=? AND status='pending'",
+            (time.time(), rid),
+        )
+    return cur.rowcount > 0

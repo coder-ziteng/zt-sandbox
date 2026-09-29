@@ -15,6 +15,7 @@
 | 数据面直连（同主机） | `http://127.0.0.1:${hostPort}/` |
 | 控制面凭据 | `Authorization: Bearer ${API_KEY}` 或 `X-API-KEY: ${API_KEY}` |
 | 管理面凭据 | `X-Admin-Token: ${ADMIN_TOKEN}` |
+| 公开申请端点 | `POST/GET/DELETE /keys/requests*`（免鉴权；查状态/领取带 `X-Request-Ticket`） |
 | 会话头（可选） | `X-Session-Id: ${sessionId}` |
 | 数据面鉴权 | `x-access-token: ${envdAccessToken}` |
 | 健康检查 | `GET /health`（无鉴权） |
@@ -35,11 +36,13 @@
 | **数据面** | `Authorization: Bearer ${API_KEY}` | `/sandboxes*`、`/v2/*`、`/v3/*`、`/templates/*`、`/internal/*`（proxy 自调） | `SBX_API_KEYS` env 或 `POST /admin/keys` mint |
 | **管理面** | `X-Admin-Token: ${ADMIN_TOKEN}` | 仅 `/admin/*` | `SBX_ADMIN_TOKEN` env，或 deploy_server 自动生成 |
 | **会话层**（可选） | `X-Session-Id: ${sessionId}` | 绑定过 `sessionId` 的 sandbox 的所有读写 + edge-proxy 数据面转发 | 客户端拥有 |
+| **公开申请层**（P4 第八刀） | 无（提交申请）；`X-Request-Ticket: ${ticket}`（查状态/领取/撤回） | 仅 `/keys/requests*` | `POST /keys/requests` 201 一次性下发 |
 
 三类凭据 **不可互换**：
 - 数据面 key 在 `/admin/*` 上 → 401
 - ADMIN_TOKEN 在 `/sandboxes` 上 → 401（视为无效数据面 key）
 - 缺失/错误的 `X-Session-Id` 在已绑定沙箱上 → 403
+- `X-Request-Ticket` 仅对其所属申请有效，不能用于数据面或 `/admin/*`
 
 ### 1.2 数据面 key 的两种风格
 
@@ -345,6 +348,42 @@ curl -H "X-API-KEY: sk-xxx..." http://host:8902/v2/templates
 
 立即生效（下次请求 401）。已撤销再删 → 404 `100014`。**响应** `200`：`{"id": "...", "revoked": true}`。
 
+### 6.4 Key 自助申请审批流（P4 第八刀）
+
+第三方 agent / 调用方**没有**管理凭证，不能直接 mint key；但可以走"申请 → 管理员审批 → 凭 ticket 一次性领取"的自助流。mint 只发生在管理员 approve 一刻；审批面板与 `approve` 响应**均不经手明文**，明文暂存于服务端 outbox，申请人 claim 后立即清除。
+
+**申请方端点（免数据面鉴权）**：
+
+| 端点 | 说明 |
+|---|---|
+| `POST /keys/requests` | 提交申请。body：`applicant` / `owner` / `tenant` 必填，`label` / `note` 可选。`201` 一次性返回 `requestID`（`kreq` 前缀）+ `ticket` |
+| `GET /keys/requests/{rid}` | 带 `X-Request-Ticket` 查进度：`pending` / `approved` / `rejected`（含 `rejectReason`）/ `cancelled` |
+| `POST /keys/requests/{rid}/claim` | 带 ticket，审批通过后**一次性**领取明文 key；再领 → 410 |
+| `DELETE /keys/requests/{rid}` | 带 ticket，撤回 `pending` 申请 |
+
+```bash
+# 提交
+curl -sS -X POST http://$HOST:8902/keys/requests \
+  -H 'Content-Type: application/json' \
+  -d '{"applicant":"my-agent","owner":"alice","tenant":"acme","label":"bot","note":"用途说明"}'
+# → {"requestID":"kreq...","ticket":"...","status":"pending","warning":"ticket 仅此一次返回..."}
+
+# 查询 / 领取
+curl -sS http://$HOST:8902/keys/requests/kreq... -H "X-Request-Ticket: $TICKET"
+curl -sS -X POST http://$HOST:8902/keys/requests/kreq.../claim -H "X-Request-Ticket: $TICKET"
+# → {"key":"e2b_k_...","meta":{...},"warning":"完整 key 仅此一次返回..."}
+```
+
+**管理员端点（`X-Admin-Token`）**：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /admin/key-requests?status=pending` | 列表（status 可空 = 全部） |
+| `POST /admin/key-requests/{rid}/approve` | 仅 `pending` 可批（并发守卫，二次 → 409）；可带 `{"owner","tenant","label"}` 覆盖签发身份；响应只含 `issuedKeyID` |
+| `POST /admin/key-requests/{rid}/reject` | `reason` 必填（400 `100013`），申请人查询时可见 |
+
+**防滥用**：按来源 IP 限流（默认 10 次 / 300s，超限 429 `100016`；env `KEY_REQUEST_RATE_LIMIT` / `KEY_REQUEST_RATE_WINDOW_S`）；同一 owner 待审批上限 5（409 `100016`；env `KEY_REQUEST_MAX_PENDING`）；字段长度 applicant≤128、owner/tenant/label≤64、note≤512（400 `100013`）。ticket 与明文 outbox 在任何列表/查询响应中均不回显。管理面板首页新增「Key 申请审批」卡片，批准/驳回一键操作。
+
 ---
 
 ## 7. 控制面端点 — Chat-Session 隔离（P4 第六刀）
@@ -510,8 +549,10 @@ NDJSON 事件类型：
 | 100013 | 400 | admin owner/tenant 必填 | `POST /admin/keys` 缺字段 |
 | 100014 | 404 | key 不存在或已撤销 | `DELETE /admin/keys/{id}` |
 | 100015 | 409 | session 已有活跃沙箱 | 重复 `POST /sandboxes` 用同 sessionId |
+| 100016 | 429 / 409 | 申请受限 | IP 限流（10/300s）或 owner 待审批上限 |
+| 100017 | 403 / 409 / 410 | ticket 无效 / 状态不符 / 已被领取 | `X-Request-Ticket` 不匹配、claim 时状态非 approved、重复 claim |
 
-> `100013` 同时被 admin "owner/tenant 必填" 与 session 校验占用，区分靠 HTTP 码（400 vs 403）。
+> `100013` 同时被 admin "owner/tenant 必填" 与 session 校验占用，区分靠 HTTP 码（400 vs 403）。`100017` 三种语义同码，区分靠 HTTP 码（403 鉴权失败、409 状态不符、410 已领取过）。
 
 ### 9.2 错误响应体
 

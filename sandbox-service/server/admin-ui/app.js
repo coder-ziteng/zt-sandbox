@@ -272,12 +272,102 @@ async function sbxAction(btn, verb, okMsg, method, path) {
   setTimeout(loadSandboxOnly, 800);
 }
 
+/* ---------------- 渲染:Key 申请审批 ---------------- */
+const KREQ_TAG = {
+  pending: '<span class="tag pending">待审批</span>',
+  approved: '<span class="tag ok-state">已批准</span>',
+  rejected: '<span class="tag revoked">已驳回</span>',
+  cancelled: '<span class="tag muted">已撤回</span>',
+};
+
+function rejectDialog(rid) {
+  const close = modal(`
+    <h3>${ICON.warn}驳回申请</h3>
+    <p>驳回理由将展示给申请人（凭 ticket 查询时可见），请写明原因。</p>
+    <div class="field"><textarea id="reject-reason" rows="3"
+      placeholder="如: owner/tenant 无法核实"></textarea></div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" data-x="cancel">取消</button>
+      <button class="btn btn-danger" data-x="ok">驳回</button>
+    </div>`);
+  const root = $("#modal-root");
+  root.querySelector('[data-x="cancel"]').onclick = close;
+  root.querySelector('[data-x="ok"]').onclick = async () => {
+    const reason = root.querySelector("#reject-reason").value.trim();
+    if (!reason) { toast("请填写驳回理由", "error"); return; }
+    close();
+    try { await api(`/admin/key-requests/${encodeURIComponent(rid)}/reject`,
+                     { method: "POST", body: { reason } });
+      toast("已驳回"); renderKeyRequests(); }
+    catch (e) { toast(e.message, "error"); }
+  };
+}
+
+async function renderKeyRequests() {
+  const box = $("#kreq-list");
+  try {
+    const data = await api("/admin/key-requests");
+    const reqs = data.requests || [];
+    const pending = reqs.filter((r) => r.status === "pending");
+    const badge = $("#kreq-pending");
+    badge.hidden = !pending.length;
+    badge.textContent = `${pending.length} 待审批`;
+    if (!reqs.length) {
+      box.innerHTML = `<div class="empty">${ICON.box}暂无申请 — 第三方可经 POST /keys/requests 提交</div>`;
+      return;
+    }
+    box.innerHTML = reqs.map((r) => `
+      <div class="row" ${r.status !== "pending" ? 'style="opacity:.6"' : ""}>
+        <div class="row-main">
+          <div class="row-title">${esc(r.requestID)} ${KREQ_TAG[r.status] || esc(r.status)}</div>
+          <div class="row-sub">
+            <span class="tag muted">${esc(r.owner)} / ${esc(r.tenant)}</span>
+            <span>申请人 ${esc(r.applicant)}</span>
+            ${r.label ? `<span>${esc(r.label)}</span>` : ""}
+            ${r.note ? `<span>备注: ${esc(r.note)}</span>` : ""}
+            ${r.status === "rejected" && r.rejectReason ? `<span>理由: ${esc(r.rejectReason)}</span>` : ""}
+            ${r.issuedKeyID ? `<span>签发 ${esc(r.issuedKeyID)}</span>` : ""}
+            <span>提交于 ${relTime(r.createdAt)}</span>
+          </div>
+        </div>
+        <div class="row-actions">
+          ${r.status === "pending" ? `
+            <button class="btn btn-primary btn-sm" data-approve="${esc(r.requestID)}">批准</button>
+            <button class="btn btn-danger btn-sm" data-reject="${esc(r.requestID)}">驳回</button>` : ""}
+        </div>
+      </div>`).join("");
+    box.querySelectorAll("[data-approve]").forEach((btn) => {
+      btn.onclick = async () => {
+        const rid = btn.getAttribute("data-approve");
+        const r = reqs.find((x) => x.requestID === rid);
+        if (!await confirmDialog("批准此申请并签发 Key？",
+            `将为 ${r.owner} / ${r.tenant}（申请人 ${r.applicant}）签发新 Key。` +
+            "明文只暂存待领取，由申请人凭 ticket 一次性取走，面板不经手明文。",
+            "批准", false)) return;
+        btn.disabled = true;
+        try {
+          const data = await api(`/admin/key-requests/${encodeURIComponent(rid)}/approve`,
+                                 { method: "POST", body: {} });
+          toast(`已批准，签发 ${data.issuedKeyID}`); renderKeyRequests(); renderKeys();
+        } catch (e) { toast(e.message, "error"); btn.disabled = false; }
+      };
+    });
+    box.querySelectorAll("[data-reject]").forEach((btn) => {
+      btn.onclick = () => rejectDialog(btn.getAttribute("data-reject"));
+    });
+  } catch (e) {
+    if (e.message !== "会话已过期") box.innerHTML = `<div class="empty">${ICON.warn}${esc(e.message)}</div>`;
+  }
+}
+
 /* ---------------- 加载编排 ---------------- */
 async function loadAll() {
   $("#cap-body").innerHTML = '<div class="skeleton sk-row"></div>';
-  await Promise.all([renderHealth(), renderKeys(), renderSandboxes()]);
+  await Promise.all([renderHealth(), renderKeys(), renderSandboxes(), renderKeyRequests()]);
 }
-async function loadSandboxOnly() { await Promise.all([renderHealth(), renderSandboxes()]); }
+async function loadSandboxOnly() {
+  await Promise.all([renderHealth(), renderSandboxes(), renderKeyRequests()]);
+}
 
 let pollTimer = null;
 function startPolling() { stopPolling(); pollTimer = setInterval(loadSandboxOnly, POLL_MS); }
@@ -321,6 +411,7 @@ $("#login-form").addEventListener("submit", async (e) => {
 $("#logout-btn").onclick = () => forceLogout();
 $("#keys-refresh").onclick = renderKeys;
 $("#sbx-refresh").onclick = renderSandboxes;
+$("#kreq-refresh").onclick = renderKeyRequests;
 
 $("#key-create-form").addEventListener("submit", async (e) => {
   e.preventDefault();

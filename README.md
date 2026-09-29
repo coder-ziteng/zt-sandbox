@@ -212,6 +212,7 @@ sbx.run_code("print(1+1)")
 | 网络策略 | `/sandboxes/{sid}/netpolicy[/refresh]` | §4 |
 | 诊断与钩子 | `/sandboxes/{sid}/diag`、`/sandboxes/{sid}/hooks/status` | §5 |
 | Admin Key 管理 | `/admin/keys`（GET/POST/DELETE） | §6 |
+| Key 申请审批 | `/admin/key-requests`（GET/approve/reject）+ 公开 `/keys/requests*`（POST/GET/claim/DELETE） | §6.4 / README §4.13.8 |
 | 管理面板 | `/admin/login`、`/admin/sandboxes[/{sid}[/pause,/resume]]`、`/admin/ui`（静态） | README §4.13.7 |
 | Chat-Session 隔离 | `sessionId` 字段 + `X-Session-Id` 头 | §7 |
 | 数据面（容器内 envd） | `/health`、`/files`、`/process.Process/*`、`/filesystem.Filesystem/*` | §8 |
@@ -243,8 +244,9 @@ sbx.run_code("print(1+1)")
 | 资源 | `100002` 模板 / `100003` 沙箱 / `100014` key 不存在 | 404 |
 | 参数 | `100004` 缺字段 / `100008` 解析错 | 400 |
 | 生命周期 | `100005` 启动 / `100006` 恢复 / `100010` hook 失败 | 500 / 503 |
-| 冲突 | `100007` 模板有依赖 / `100015` session 已占 | 409 |
-| 配额 | `100009` 数量/内存超限 | 429 |
+| 冲突 | `100007` 模板有依赖 / `100015` session 已占 / `100017` ticket 状态不符 | 409 |
+| 配额 / 限流 | `100009` 数量/内存超限 / `100016` 申请限流 | 429 |
+| 自助申请 | `100017` ticket 无效或已被领取 | 403 / 410 |
 
 ---
 
@@ -1133,6 +1135,7 @@ ADMIN_TOKEN=adm_xxx...
 |---|---|---|
 | 容量 / 服务状态 | `GET /health`（免鉴权） | 实例容量、CPU/内存已投入、CRIU / 网络策略可用性 |
 | API Key 管理 | `GET/POST/DELETE /admin/keys` | 列表（含已撤销）、给 owner/tenant 签发（明文仅一次 + 复制）、撤销（二次确认） |
+| Key 申请审批 | `/admin/key-requests` 一族（见 §4.13.8） | 第三方自助申请的待审批列表（待审批角标）、批准 / 驳回（带理由）；面板不经手明文 |
 | 沙箱实例 | `/admin/sandboxes` 一族 | 跨 owner 查看全部实例（不含 envd token）、暂停 / 恢复 / 销毁、TTL 倒计时、15s 轮询 |
 
 **新增管理面端点**（需 `ADMIN_TOKEN` 或有效 session token；`/admin/login` 与 `/admin/ui` 静态资源豁免）：
@@ -1154,6 +1157,31 @@ ADMIN_SESSION_TTL_S=28800   # 可选
 ```
 
 冒烟：[tests/admin_panel_smoke.py](sandbox-service/tests/admin_panel_smoke.py) 9 项（错凭据 401 / 签发验签 / 伪造+过期 401 / 数据面 key 拒 / ADMIN_TOKEN 兼容 / 静态页豁免 / pause+resume / 建 key+撤销全链路）。
+
+#### 4.13.8 Key 自助申请审批流 (`/keys/requests`, P4 第八刀)
+
+第三方 agent / 调用方**没有**管理凭证，不能直接 mint key。本刀实现"申请 → 管理员审批 → 凭 ticket 一次性领取"的自助流：**mint 只发生在管理员 approve 一刻**；审批面板与 approve 响应**均不经手明文**，明文暂存服务端 outbox，申请人 claim 后立即清除（项目本来就以明文存 `envd_token`，风险面一致）。
+
+**申请方端点（`/keys/requests*` 免数据面鉴权）**：
+
+| 端点 | 说明 |
+|---|---|
+| `POST /keys/requests` | body：`applicant` / `owner` / `tenant` 必填，`label` / `note` 可选。`201` 一次性返回 `requestID`（`kreq` 前缀）+ `ticket` |
+| `GET /keys/requests/{rid}` | 带 `X-Request-Ticket` 查进度：`pending` / `approved` / `rejected`（含 `rejectReason`）/ `cancelled` |
+| `POST /keys/requests/{rid}/claim` | 带 ticket，审批通过后**一次性**领取明文 key；再领 → 410 |
+| `DELETE /keys/requests/{rid}` | 带 ticket，撤回 `pending` 申请 |
+
+**管理员端点（`X-Admin-Token` 或 session token）**：
+
+| 端点 | 说明 |
+|---|---|
+| `GET /admin/key-requests?status=pending` | 列表（status 可空 = 全部），任何列表/查询响应均不回显 ticket 与明文 outbox |
+| `POST /admin/key-requests/{rid}/approve` | 仅 `pending` 可批（并发守卫，二次 → 409）；可带 `{"owner","tenant","label"}` 覆盖签发身份；响应只含 `issuedKeyID` |
+| `POST /admin/key-requests/{rid}/reject` | `reason` 必填，申请人查询时可见 |
+
+**端点细节、curl 示例与错误码**：见 [zt_sandbox_api_doc.md §6.4](zt_sandbox_api_doc.md)。**防滥用**：按 IP 限流默认 10 次 / 300s（env `KEY_REQUEST_RATE_LIMIT` / `KEY_REQUEST_RATE_WINDOW_S`），同一 owner 待审批上限 5（env `KEY_REQUEST_MAX_PENDING`），超出 → 429 `100016`；字段长度 applicant≤128、owner/tenant/label≤64、note≤512，超出 → 400 `100013`。tiket 错误 / 状态不符 / 已被领取均复用 `100017`，区分靠 HTTP 码（403 / 409 / 410）。
+
+冒烟：[tests/key_requests_smoke.py](sandbox-service/tests/key_requests_smoke.py) 10 项（免鉴权提交 / 字段校验 / ticket 鉴权 / pending 不能 claim / 列表不泄露敏感字段 / approve 二次 409 / claim 一次性 + 重复 410 / 领到即数据面可用 + 撤销 / reject 理由可见 / 撤回后不可审批）。
 
 ---
 
@@ -1193,6 +1221,7 @@ ADMIN_SESSION_TTL_S=28800   # 可选
 | **P4 Admin Keys** | `tests/admin_keys_smoke.py` | **ADMIN_TOKEN 鉴权 + 完整 key 仅一次返回 + 撤销立即生效 + 数据面 key 在 admin 入口被拒（11 项）** |
 | **P4 Chat-Session 隔离** | `tests/session_smoke.py` | **Session = Sandbox：create 绑 sessionId / dup 409 / 跨 session 403 / list 过滤 / edge-proxy 校验 / 撤销重绑 / legacy 兼容（14 项）** |
 | **P4 管理面板** | `tests/admin_panel_smoke.py` | **登录签发 HMAC session token + 伪造/过期拒绝 + 数据面 key 隔离 + admin 沙箱 pause/resume + key 全链路（9 项）** |
+| **P4 Key 自助申请** | `tests/key_requests_smoke.py` | **免鉴权提交 + ticket 鉴权 + approve/claim 一次性 + reject 理由可见 + 撤回 + 数据面 key 立即可用（10 项）** |
 | **纯 REST 全链路** | `tests/bubble_sort_demo.py [key] [--tunnel]` | **不依赖 SDK：建模板→查 templateID→创建→就绪→jupyter /execute 跑冒泡排序→流式收 NDJSON→销毁；--tunnel 走 SSH 绕行 443（见 §8.10）** |
 | **速度基线** | `tests/bench_speed.py [key] [轮数=10]` | **冷启动完整生命周期 ×N + 单沙箱热执行 ×N，分阶段计时（create/health/exec/kill/total）** |
 
@@ -1218,6 +1247,7 @@ python tests/path_sandbox_smoke.py          # 容器内 /workspace 路径沙箱
 python tests/admin_keys_smoke.py            # /admin/keys 管理入口 (需要 ADMIN_TOKEN)
 python tests/session_smoke.py               # chat-session 隔离 (Session = Sandbox)
 python tests/admin_panel_smoke.py           # 管理面板 (需要 ADMIN_TOKEN + SBX_ADMIN_USER/PASSWORD)
+python tests/key_requests_smoke.py          # Key 自助申请审批流 (需要 ADMIN_TOKEN)
 python tests/bubble_sort_demo.py ${SBX_API_KEY} --tunnel   # 纯 REST 全链路冒烟（443 受限时加 --tunnel）
 python tests/bench_speed.py ${SBX_API_KEY} 10              # 速度基线：10 冷 + 10 热
 ```

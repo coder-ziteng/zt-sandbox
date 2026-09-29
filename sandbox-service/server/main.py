@@ -8,6 +8,8 @@ import hmac
 import json
 import logging
 import os
+import secrets
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -130,6 +132,10 @@ async def auth(request: Request, call_next):
             return err(100012, "admin 凭证无效", 401)
         return await call_next(request)
     if path in ("/health", "/metrics", "/") or path.startswith("/internal"):
+        return await call_next(request)
+    # P4 第八刀: 自助申请 API Key 的公开端点。申请时调用方还没有任何凭证,
+    # 故豁免数据面鉴权; 后续查状态/领取/撤回凭一次性 ticket header 自证。
+    if path == "/keys/requests" or path.startswith("/keys/requests/"):
         return await call_next(request)
     # Two credential styles are accepted:
     #   Authorization: Bearer <key>   (Bailian / our REST convention)
@@ -309,6 +315,154 @@ def admin_revoke_key(key_id: str):
     if not store.revoke_api_key(key_id):
         return err(100014, f"key 不存在或已撤销: {key_id}", 404)
     return {"id": key_id, "revoked": True}
+
+
+# ---------------- key self-service requests (P4 第八刀) ----------------
+# 第三方 agent/调用方没有管理凭证,不能直接 mint key,但可以走公开申请流:
+#   POST   /keys/requests             落库 pending,一次性返回 ticket
+#   GET    /keys/requests/{rid}       凭 X-Request-Ticket 查进度
+#   POST   /keys/requests/{rid}/claim 审批通过后凭 ticket 一次性领取明文 key
+#   DELETE /keys/requests/{rid}       申请人撤回 pending 申请
+# mint 只发生在管理员 approve 一刻; approve 响应不含明文,明文暂存 outbox
+# 列,claim 后清空 (项目本就以明文存 envd_token,风险面一致)。
+
+_req_throttle: dict[str, list[float]] = {}
+_req_throttle_lock = threading.Lock()
+KEY_REQUEST_RATE_LIMIT = int(os.getenv("KEY_REQUEST_RATE_LIMIT", "10"))
+KEY_REQUEST_RATE_WINDOW_S = int(os.getenv("KEY_REQUEST_RATE_WINDOW_S", "300"))
+KEY_REQUEST_MAX_PENDING = int(os.getenv("KEY_REQUEST_MAX_PENDING", "5"))
+
+
+def _req_throttled(ip: str) -> bool:
+    now = time.time()
+    with _req_throttle_lock:
+        hits = [t for t in _req_throttle.get(ip, []) if now - t < KEY_REQUEST_RATE_WINDOW_S]
+        hits.append(now)
+        _req_throttle[ip] = hits
+        return len(hits) > KEY_REQUEST_RATE_LIMIT
+
+
+def _request_ticket_ok(request: Request, rid: str) -> bool:
+    return store.verify_request_ticket(rid, request.headers.get("x-request-ticket", "").strip())
+
+
+@app.post("/keys/requests")
+async def submit_key_request(request: Request):
+    ip = request.client.host if request.client else "?"
+    if _req_throttled(ip):
+        return err(100016, f"申请过于频繁 (每 {KEY_REQUEST_RATE_WINDOW_S}s 最多 {KEY_REQUEST_RATE_LIMIT} 次)", 429)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    applicant = str(body.get("applicant") or "").strip()
+    owner = str(body.get("owner") or "").strip()
+    tenant = str(body.get("tenant") or "").strip()
+    label = str(body.get("label") or "").strip()
+    note = str(body.get("note") or "").strip()
+    if not applicant or not owner or not tenant:
+        return err(100013, "applicant/owner/tenant 必填", 400)
+    if (len(applicant) > 128 or len(owner) > 64 or len(tenant) > 64
+            or len(label) > 64 or len(note) > 512):
+        return err(100013, "字段超长 (applicant≤128, owner/tenant/label≤64, note≤512)", 400)
+    if store.pending_count_for_owner(owner) >= KEY_REQUEST_MAX_PENDING:
+        return err(100016, f"owner '{owner}' 已有 {KEY_REQUEST_MAX_PENDING} 个待审批申请,请等待处理", 409)
+    ticket = secrets.token_urlsafe(24)
+    rid = store.create_key_request(applicant, owner, tenant, label, note, ticket)
+    return JSONResponse(
+        {
+            "requestID": rid,
+            "ticket": ticket,
+            "status": "pending",
+            "warning": "ticket 仅此一次返回,用于查询进度与领取 key,请立即保存。",
+        },
+        status_code=201,
+    )
+
+
+@app.get("/keys/requests/{rid}")
+def fetch_key_request(rid: str, request: Request):
+    if not _request_ticket_ok(request, rid) or store.get_key_request(rid) is None:
+        return err(100017, "ticket 无效或申请不存在", 403)
+    return store.get_key_request(rid)
+
+
+@app.post("/keys/requests/{rid}/claim")
+def claim_issued_key(rid: str, request: Request):
+    if not _request_ticket_ok(request, rid):
+        return err(100017, "ticket 无效或申请不存在", 403)
+    plaintext = store.claim_key_request(rid)
+    if plaintext is None:
+        row = store.get_key_request(rid)
+        status = row["status"] if row else "unknown"
+        if status == "approved":
+            return err(100017, "key 已被领取过,明文不可恢复", 410)
+        return err(100017, f"申请状态为 {status},尚无可领取的 key", 409)
+    return JSONResponse(
+        {
+            "key": plaintext,
+            "meta": store.get_key_request(rid),
+            "warning": "完整 key 仅此一次返回,请立即保存到安全的地方。",
+        }
+    )
+
+
+@app.delete("/keys/requests/{rid}")
+def withdraw_key_request(rid: str, request: Request):
+    if not _request_ticket_ok(request, rid):
+        return err(100017, "ticket 无效或申请不存在", 403)
+    if not store.cancel_key_request(rid):
+        row = store.get_key_request(rid)
+        status = row["status"] if row else "unknown"
+        return err(100017, f"仅 pending 申请可撤回 (当前状态: {status})", 409)
+    return {"requestID": rid, "status": "cancelled"}
+
+
+@app.get("/admin/key-requests")
+def admin_list_key_requests(status: str = ""):
+    return {"requests": store.list_key_requests(status or None)}
+
+
+@app.post("/admin/key-requests/{rid}/approve")
+async def admin_approve_key_request(rid: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    row = store.get_key_request(rid)
+    if not row:
+        return err(100014, f"申请不存在: {rid}", 404)
+    owner = str(body.get("owner") or row["owner"]).strip()
+    tenant = str(body.get("tenant") or row["tenant"]).strip()
+    label = str(body.get("label") or row["label"]).strip()
+    meta, plaintext = store.generate_api_key(owner, tenant, label)
+    # 状态守卫在 store 层 (WHERE status='pending'); 并发/重复审批时
+    # 回滚刚 mint 的 key,避免留下孤儿凭证。
+    if not store.approve_key_request(rid, meta["id"], plaintext,
+                                     owner=owner, tenant=tenant, label=label):
+        store.revoke_api_key(meta["id"])
+        fresh = store.get_key_request(rid)
+        return err(100014, f"申请状态为 {fresh['status'] if fresh else 'unknown'},仅 pending 可审批", 409)
+    return {"requestID": rid, "status": "approved", "issuedKeyID": meta["id"],
+            "owner": owner, "tenant": tenant, "label": label,
+            "note": "明文已暂存,申请人凭 ticket 一次性领取; 本响应不含明文。"}
+
+
+@app.post("/admin/key-requests/{rid}/reject")
+async def admin_reject_key_request(rid: str, request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    reason = str(body.get("reason") or "").strip()
+    if not reason:
+        return err(100013, "reason 必填", 400)
+    if not store.reject_key_request(rid, reason[:512]):
+        row = store.get_key_request(rid)
+        if not row:
+            return err(100014, f"申请不存在: {rid}", 404)
+        return err(100014, f"申请状态为 {row['status']},仅 pending 可驳回", 409)
+    return {"requestID": rid, "status": "rejected"}
 
 
 # ---------------- /admin panel (P4 第七刀 — 管理面板) ----------------
