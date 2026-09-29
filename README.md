@@ -219,6 +219,7 @@ sbx.run_code("print(1+1)")
 | `GET` / `POST` / `DELETE` | `/sandboxes/{id}/netpolicy` | 网络白名单 |
 | `POST` | `/sandboxes/{id}/netpolicy/refresh` | 手动重解析 FQDN（CDN 切换） |
 | `GET` | `/sandboxes/{id}/diag` | 沙箱诊断快照（进程 / 资源 / 日志 / 连接 / envd） |
+| `GET` | `/metrics` | Prometheus 可抓取的控制面指标（无需鉴权） |
 
 数据面（每个沙箱）：
 
@@ -907,6 +908,64 @@ python sandbox-service/tests/diag_smoke.py
 9. 不存在的 sandbox → 404
 10. 两次采样 netRx/netTx 单调不减
 
+### 4.12 可观测性指标（Prometheus / OTLP 兼容）
+
+> 🆕 P3 引入。把关键业务事件 + HTTP 流量暴露成 `/metrics` 端点（Prometheus exposition 格式）。任何 Prometheus 兼容的 TSDB 都能直接抓取（VictoriaMetrics / Datadog Agent / OTel Collector 的 prometheus receiver）。
+
+#### 4.12.1 端点
+
+```bash
+# 无需鉴权 — 指标不含敏感信息
+curl http://127.0.0.1:8902/metrics
+```
+
+#### 4.12.2 指标一览
+
+| 指标 | 类型 | 含义 |
+|---|---|---|
+| `sandbox_created_total{template}` | Counter | 沙箱创建次数（按 template 分组） |
+| `sandbox_destroyed_total{reason}` | Counter | 沙箱销毁次数（reason: user / timeout / watchdog） |
+| `sandbox_active{state}` | Gauge | 当前 running / paused 沙箱数 |
+| `http_requests_total{method,endpoint,status}` | Counter | HTTP 请求次数（`/sandboxes/<id>` 归一化为 `/sandboxes/{id}`） |
+| `http_request_duration_seconds{method,endpoint}` | Histogram | 请求时延（0.005s / 0.01s / 0.1s / 1s / 10s 档位） |
+| `netpolicy_applied_total` | Counter | 网络白名单 apply 次数 |
+| `netpolicy_refreshed_total` | Counter | 网络白名单 refresh 次数（手动 + 后台周期） |
+| `hook_invocations_total{kind}` | Counter | 钩子触发次数（startup / periodic） |
+| `hook_failures_total{kind}` | Counter | 钩子失败次数 |
+| `diagnostics_calls_total{section}` | Counter | diag 端点各 section 被访问次数 |
+
+#### 4.12.3 端点路径归一化
+
+每个 HTTP 请求的 `endpoint` label 都会经过归一化：
+- `/sandboxes/sbxabc123` → `/sandboxes/{id}`
+- `/sandboxes/sbxabc123/pause` → `/sandboxes/{id}/pause`
+- `/templates/tmplabc123/hooks` → `/templates/{id}/hooks`
+
+这防止 Prometheus 为每个沙箱 / 模版创建单独 series（高基数会炸内存）。
+
+#### 4.12.4 设计取舍
+
+- **选 prometheus-client 而不是直接上 OTLP 推流**：自包含、零配置、/metrics 端点天然兼容任何 TSDB。未来要真正推 OTLP 只需加 `opentelemetry-sdk` + `OTLPMetricExporter` 作为另一个 `MetricReader`，代码结构不用改。
+- **/metrics 不记录自己**：避免自激导致计数器爆炸。
+- **/health 也不在 auth 白名单中**：但 /health 请求仍然计入 `http_requests_total`（有 /health 流量很正常，不该隐藏）。
+
+#### 4.12.5 端到端冒烟
+
+```bash
+python sandbox-service/tests/metrics_smoke.py
+```
+
+跑 8 项：
+
+1. /metrics 返回 200 + Prometheus 文本格式
+2. 必需指标族全存在
+3. `http_requests_total` 有真实样本且 ≥ 1
+4. `http_request_duration_seconds` 是合法 histogram（含 le=+Inf 桶）
+5. 端点归一化生效（原始 sbx/tmpl ID 不出现在 label 中）
+6. `sandbox_created_total` / `sandbox_destroyed_total` 在创建 / 销毁后递增
+7. `diagnostics_calls_total` 在调用 /diag 后递增
+8. `/metrics` 端点不记入 `http_requests_total`（无自激）
+
 ---
 
 ## 5. 镜像矩阵
@@ -939,6 +998,7 @@ python sandbox-service/tests/diag_smoke.py
 | **P3 Ingress Keepalive** | `tests/keepalive_smoke.py` | **paused 沙箱自动唤醒（4 项：wake vs fast path 时延对比 + 二次唤醒循环 + 幂等）** |
 | **P3 FQDN Allowlist** | `tests/fqdn_smoke.py` | **通配符展开 + CDN 切换 refresh + 精确模式不展开（3 项）** |
 | **P3 Diagnostic API** | `tests/diag_smoke.py` | **5 section 独立采集 + subset + 404 + 计数器单调性（10 项）** |
+| **P3 Prometheus Metrics** | `tests/metrics_smoke.py` | **/metrics 端点 + 指标族 + 归一化 + 生命周期计数器（7 项）** |
 
 运行：
 ```bash
@@ -956,6 +1016,7 @@ python tests/mcp_smoke.py                      # MCP 集成冒烟
 python tests/hook_smoke.py                     # 钩子 + watchdog
 python tests/fqdn_smoke.py                    # FQDN 通配符 + CDN refresh
 python tests/diag_smoke.py                    # 沙箱诊断快照
+python tests/metrics_smoke.py                # Prometheus 指标冒烟
 ```
 
 ---

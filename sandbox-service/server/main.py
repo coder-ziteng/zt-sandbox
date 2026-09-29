@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 
 import netpolicy
 import diagnostics
+import metrics
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
@@ -41,7 +42,7 @@ def err(code: int, message: str, status: int):
 @app.middleware("http")
 async def auth(request: Request, call_next):
     path = request.url.path
-    if path in ("/health", "/") or path.startswith("/internal"):
+    if path in ("/health", "/metrics", "/") or path.startswith("/internal"):
         return await call_next(request)
     # Two credential styles are accepted:
     #   Authorization: Bearer <key>   (Bailian / our REST convention)
@@ -53,6 +54,23 @@ async def auth(request: Request, call_next):
     if token not in API_KEYS:
         return err(100001, "API Key 无效", 401)
     return await call_next(request)
+
+
+@app.middleware("http")
+async def record_http(request: Request, call_next):
+    """HTTP 流量观测: 每次请求记一次 counter + histogram。
+    /metrics 端点本身不记录 (避免自激)。"""
+    path = request.url.path
+    if path == "/metrics":
+        return await call_next(request)
+    t0 = time.time()
+    response = await call_next(request)
+    dt = time.time() - t0
+    endpoint = metrics.normalize_endpoint(path)
+    metrics.HTTP_REQUESTS.labels(method=request.method, endpoint=endpoint,
+                                  status=response.status_code).inc()
+    metrics.HTTP_DURATION.labels(method=request.method, endpoint=endpoint).observe(dt)
+    return response
 
 
 def iso(ts: float) -> str:
@@ -98,6 +116,17 @@ def health():
         "netpolicy": netpolicy.supported(),
         "capacity": {"max": MAX_SANDBOXES, "used": store.count_active(), **store.committed_resources()},
     }
+
+
+@app.get("/metrics")
+def prometheus_metrics():
+    """Prometheus-format metrics — 沙箱生命周期 / HTTP 流量 / 网络策略 / 钩子 / 诊断。
+
+    任何 Prometheus 兼容的 TSDB 都可以直接抓取这个端点
+    (Prometheus / VictoriaMetrics / Datadog Agent / OTel Collector 的
+    prometheus receiver)。无需鉴权 — 指标不含敏感信息。
+    """
+    return Response(content=metrics.render(), media_type=metrics.CONTENT_TYPE)
 
 
 @app.post("/sandboxes")
@@ -168,6 +197,8 @@ async def create_sandbox(request: Request):
         store.update_sandbox(sandbox_id, hook_state=json.dumps(hook_state))
     row = store.get_sandbox(sandbox_id)
     log.info("created sandbox %s ports=%s features=%s ttl=%ss", sandbox_id, ports, features, timeout)
+    metrics.SANDBOX_CREATED.labels(template=template_id).inc()
+    metrics.SANDBOX_ACTIVE.labels(state="running").inc()
     return JSONResponse(sandbox_json(row, with_token=True), status_code=201)
 
 
@@ -294,6 +325,8 @@ async def pause_sandbox(sandbox_id: str, request: Request):
     if mode == "stop":
         runtime.stop_container(sandbox_id)
     store.update_sandbox(sandbox_id, state="paused", pause_mode=mode)
+    metrics.SANDBOX_ACTIVE.labels(state="running").dec()
+    metrics.SANDBOX_ACTIVE.labels(state="paused").inc()
     return Response(status_code=204)
 
 
@@ -315,6 +348,8 @@ async def resume_sandbox(sandbox_id: str, request: Request):
     store.update_sandbox(sandbox_id, state="running", end_at=time.time() + timeout,
                          last_activity=time.time())
     row = store.get_sandbox(sandbox_id)
+    metrics.SANDBOX_ACTIVE.labels(state="paused").dec()
+    metrics.SANDBOX_ACTIVE.labels(state="running").inc()
     return sandbox_json(row, with_token=True)
 
 
@@ -323,9 +358,13 @@ def kill_sandbox(sandbox_id: str):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return Response(status_code=404)
+    prev_state = row.get("state", "running")
     runtime.remove_container(sandbox_id)
     store.delete_sandbox(sandbox_id)
     log.info("killed sandbox %s", sandbox_id)
+    metrics.SANDBOX_DESTROYED.labels(reason="user").inc()
+    if prev_state in ("running", "paused"):
+        metrics.SANDBOX_ACTIVE.labels(state=prev_state).dec()
     return Response(status_code=204)
 
 
@@ -374,7 +413,10 @@ async def set_netpolicy(sandbox_id: str, request: Request):
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
     body = await request.json()
     ip = runtime.container_ip(sandbox_id)
-    return netpolicy.apply(sandbox_id, ip, body)
+    r = netpolicy.apply(sandbox_id, ip, body)
+    if r.get("applied"):
+        metrics.NETPOLICY_APPLIED.inc()
+    return r
 
 
 @app.post("/sandboxes/{sandbox_id}/netpolicy/refresh")
@@ -387,6 +429,7 @@ def refresh_netpolicy(sandbox_id: str):
     if r is None:
         return {"sandboxID": sandbox_id, "skipped": True,
                 "reason": "no active allowlist (open/blocked mode or sandbox torn down)"}
+    metrics.NETPOLICY_REFRESHED.inc()
     return r
 
 
@@ -418,6 +461,10 @@ def sandbox_diag(sandbox_id: str, request: Request):
         log_tail = int(request.query_params.get("logTail", "100"))
     except ValueError:
         return err(100008, "logTail must be int", 400)
+    # 记录 diagnostics 被请求的 section
+    sections = include if include else list(diagnostics.ALL_SECTIONS)
+    for s in sections:
+        metrics.DIAG_CALLS.labels(section=s).inc()
     return diagnostics.gather(
         sandbox_id,
         include=include,
@@ -446,6 +493,8 @@ async def internal_auto_resume(request: Request):
         return err(100006, msg, 503)
     store.update_sandbox(sandbox_id, state="running", last_activity=time.time())
     log.info("auto-resumed sandbox %s via ingress keepalive trigger", sandbox_id)
+    metrics.SANDBOX_ACTIVE.labels(state="paused").dec()
+    metrics.SANDBOX_ACTIVE.labels(state="running").inc()
     return {"ok": True}
 
 
