@@ -51,17 +51,17 @@
 curl -sS http://${SBX_SSH_HOST}:8902/health \
   -H "Authorization: Bearer ${SBX_API_KEY}" | jq
 
-# 创建沙箱（默认 code-interpreter 模板）
+# 创建沙箱。templateID 可直接传模板名（"code-interpreter"）或 tmpl code，两者都解析
 SID=$(curl -sS -X POST http://${SBX_SSH_HOST}:8902/sandboxes \
   -H "Authorization: Bearer ${SBX_API_KEY}" -H "Content-Type: application/json" \
   -d '{"templateID":"code-interpreter","timeout":600}' | jq -r .sandboxID)
 echo "sandbox=$SID"
 
-# 等 health=true
-for i in {1..30}; do
+# 等就绪。总 .ok 按模板 features 聚合：code-interpreter 约 200ms；带 browser 的模板要等 Chromium 30-60s
+for i in {1..60}; do
   curl -sS http://${SBX_SSH_HOST}:8902/sandboxes/$SID/health \
     -H "Authorization: Bearer ${SBX_API_KEY}" | jq -e '.ok' >/dev/null && break
-  sleep 2
+  sleep 1
 done
 
 # 销毁
@@ -184,6 +184,9 @@ sbx.run_code("print(1+1)")
 | `MAX_SANDBOXES` | ❌ | `24` | 全局最大并发沙箱数（429 配额满错误码） |
 | `MAX_MEMORY_MB` | ❌ | `6144` | 全局内存配额（MB），所有沙箱 memoryMB 之和 |
 | `CHECKPOINT_DIR` | ❌ | `/var/lib/sbx-checkpoints` | CRIU checkpoint 落盘目录 |
+| `ADMIN_TOKEN` | ❌ | 空 | **P4**：`/admin/*` 管理面凭据，留空时 deploy 自动生成并打印一次，详见 §4.13.5 |
+| `ADMIN_USER` / `ADMIN_PASSWORD` | ❌ | 空 | **P4**：管理面板登录凭据（= `SBX_SSH_USER` / `SBX_SSH_PASSWORD`，deploy 自动写入），详见 §4.13.7 |
+| `ADMIN_SESSION_TTL_S` | ❌ | `28800` | **P4**：面板 session token 有效期（秒），默认 8 小时 |
 
 **MCP server**（本地 Claude Code / Cursor 进程）：
 
@@ -209,6 +212,7 @@ sbx.run_code("print(1+1)")
 | 网络策略 | `/sandboxes/{sid}/netpolicy[/refresh]` | §4 |
 | 诊断与钩子 | `/sandboxes/{sid}/diag`、`/sandboxes/{sid}/hooks/status` | §5 |
 | Admin Key 管理 | `/admin/keys`（GET/POST/DELETE） | §6 |
+| 管理面板 | `/admin/login`、`/admin/sandboxes[/{sid}[/pause,/resume]]`、`/admin/ui`（静态） | README §4.13.7 |
 | Chat-Session 隔离 | `sessionId` 字段 + `X-Session-Id` 头 | §7 |
 | 数据面（容器内 envd） | `/health`、`/files`、`/process.Process/*`、`/filesystem.Filesystem/*` | §8 |
 
@@ -223,7 +227,7 @@ sbx.run_code("print(1+1)")
 鉴权速记：
 
 - 数据面 `Authorization: Bearer ${API_KEY}` 或 `X-API-KEY: ${API_KEY}`（SDK 用后者）
-- 管理面 `X-Admin-Token: ${ADMIN_TOKEN}`（仅 `/admin/*` 接受）
+- 管理面 `X-Admin-Token: ${ADMIN_TOKEN}` 或面板登录签发的 `sbxsess.*` session token（仅 `/admin/*` 接受）
 - 数据面（容器内） `x-access-token: ${envdAccessToken}` + 可选 `X-Session-Id: ${sessionId}`
 - 三个凭据互不替换
 
@@ -1111,6 +1115,46 @@ ADMIN_TOKEN=adm_xxx...
 
 冒烟：[tests/session_smoke.py](sandbox-service/tests/session_smoke.py) 14 项（控制面 + edge-proxy + 重复绑定 + 撤销重绑 + legacy 兼容）。
 
+#### 4.13.7 管理面板 (`/admin/ui`, P4 第七刀)
+
+内嵌在控制面的可视化运维入口，不需要额外部署：`server/admin-ui/` 纯 HTML/CSS/JS（Bento Grid + Liquid Glass，零外部 CDN 依赖，内网可用），由 FastAPI `StaticFiles` 挂载。
+
+**入口**：`http://${SBX_SSH_HOST}:8902/admin/ui/`
+
+**登录凭据**：`ADMIN_USER` / `ADMIN_PASSWORD` 由 `deploy_server.py` 写入 `deploy/.env`，取值与 `SBX_SSH_USER` / `SBX_SSH_PASSWORD`（宿主机 SSH 账号）一致。登录成功后签发 HMAC 短效 session token：
+
+- 格式 `sbxsess.<exp>.<sig>`，默认 8 小时有效（`ADMIN_SESSION_TTL_S` 可调）
+- 签名以 `ADMIN_TOKEN` 为密钥，**浏览器永远接触不到 ADMIN_TOKEN 本身** — 弱 SSH 密码不会"升级"出最强管理凭据
+- session token 只对 `/admin/*` 生效，数据面不认；数据面 key 在 `/admin/*` 依旧显式 401（第五刀隔离不变量保持）
+
+**面板能力**：
+
+| 瓦片 | 背后端点 | 操作 |
+|---|---|---|
+| 容量 / 服务状态 | `GET /health`（免鉴权） | 实例容量、CPU/内存已投入、CRIU / 网络策略可用性 |
+| API Key 管理 | `GET/POST/DELETE /admin/keys` | 列表（含已撤销）、给 owner/tenant 签发（明文仅一次 + 复制）、撤销（二次确认） |
+| 沙箱实例 | `/admin/sandboxes` 一族 | 跨 owner 查看全部实例（不含 envd token）、暂停 / 恢复 / 销毁、TTL 倒计时、15s 轮询 |
+
+**新增管理面端点**（需 `ADMIN_TOKEN` 或有效 session token；`/admin/login` 与 `/admin/ui` 静态资源豁免）：
+
+| 端点 | 说明 |
+|---|---|
+| `POST /admin/login` | 用户名密码登录，返回 `{token, expiresAt}` |
+| `GET /admin/sandboxes` | 全量实例列表（running + paused），**不返回** `envdAccessToken` |
+| `POST /admin/sandboxes/{sid}/pause` | 等价数据面 pause（CRIU 优先，降级 docker stop），跳过 owner 校验 |
+| `POST /admin/sandboxes/{sid}/resume` | 等价数据面 resume（等待 envd 就绪 + 续期 timeout） |
+| `DELETE /admin/sandboxes/{sid}` | 销毁容器 + 删除记录（`SANDBOX_DESTROYED{reason="admin"}`） |
+
+`.env` 增量（deploy_server.py 自动写入，无需手填）：
+
+```bash
+ADMIN_USER=root
+ADMIN_PASSWORD=...          # = SBX_SSH_PASSWORD
+ADMIN_SESSION_TTL_S=28800   # 可选
+```
+
+冒烟：[tests/admin_panel_smoke.py](sandbox-service/tests/admin_panel_smoke.py) 9 项（错凭据 401 / 签发验签 / 伪造+过期 401 / 数据面 key 拒 / ADMIN_TOKEN 兼容 / 静态页豁免 / pause+resume / 建 key+撤销全链路）。
+
 ---
 
 ## 5. 镜像矩阵
@@ -1148,6 +1192,9 @@ ADMIN_TOKEN=adm_xxx...
 | **P4 路径沙箱** | `tests/path_sandbox_smoke.py` | **/workspace 允许 + /etc /root /proc / 越界 全部 403 + /tmp 允许 + ConnectRPC 路径校验（14 项）** |
 | **P4 Admin Keys** | `tests/admin_keys_smoke.py` | **ADMIN_TOKEN 鉴权 + 完整 key 仅一次返回 + 撤销立即生效 + 数据面 key 在 admin 入口被拒（11 项）** |
 | **P4 Chat-Session 隔离** | `tests/session_smoke.py` | **Session = Sandbox：create 绑 sessionId / dup 409 / 跨 session 403 / list 过滤 / edge-proxy 校验 / 撤销重绑 / legacy 兼容（14 项）** |
+| **P4 管理面板** | `tests/admin_panel_smoke.py` | **登录签发 HMAC session token + 伪造/过期拒绝 + 数据面 key 隔离 + admin 沙箱 pause/resume + key 全链路（9 项）** |
+| **纯 REST 全链路** | `tests/bubble_sort_demo.py [key] [--tunnel]` | **不依赖 SDK：建模板→查 templateID→创建→就绪→jupyter /execute 跑冒泡排序→流式收 NDJSON→销毁；--tunnel 走 SSH 绕行 443（见 §8.10）** |
+| **速度基线** | `tests/bench_speed.py [key] [轮数=10]` | **冷启动完整生命周期 ×N + 单沙箱热执行 ×N，分阶段计时（create/health/exec/kill/total）** |
 
 运行：
 ```bash
@@ -1170,7 +1217,23 @@ python tests/ownership_smoke.py             # 多租户归属 (需要 API_KEYS_J
 python tests/path_sandbox_smoke.py          # 容器内 /workspace 路径沙箱
 python tests/admin_keys_smoke.py            # /admin/keys 管理入口 (需要 ADMIN_TOKEN)
 python tests/session_smoke.py               # chat-session 隔离 (Session = Sandbox)
+python tests/admin_panel_smoke.py           # 管理面板 (需要 ADMIN_TOKEN + SBX_ADMIN_USER/PASSWORD)
+python tests/bubble_sort_demo.py ${SBX_API_KEY} --tunnel   # 纯 REST 全链路冒烟（443 受限时加 --tunnel）
+python tests/bench_speed.py ${SBX_API_KEY} 10              # 速度基线：10 冷 + 10 热
 ```
+
+**实测性能基线**（2026-09-29，code-interpreter 模板，负载 = 500 元素冒泡排序，经 SSH 隧道连数据面，直连 443 只会更快）：
+
+| 阶段 | 平均 | 波动 (stdev) | 说明 |
+| --- | --- | --- | --- |
+| create（REST 返回） | ~1.7 s | 229 ms | 容器启动，镜像已在本地 |
+| health 就绪 | ~0.2 s | 33 ms | envd + jupyter 分项 |
+| 首次执行（含 kernel 启动） | ~1.0 s | 33 ms | kernel 冷启动约 0.8 s |
+| 热执行（kernel 复用） | ~0.24 s | 38 ms | 多轮对话每轮的真实开销 |
+| kill | ~0.2 s | 22 ms | 容器 + 端口回收 |
+| **端到端总计** | **~3.1 s** | 272 ms | 单次任务一个沙箱模式的接入成本 |
+
+10/10 冷启动与 10/10 热执行全部成功，方差小，适合作为回归基准。
 
 ---
 
@@ -1223,6 +1286,15 @@ Docker 29 默认开 containerd snapshotter，会撞 CRIU 恢复时的 content-st
 ### 8.7 compose 没声明 `build:` 段不会被 `--build` 重建
 `docker compose up --build` 只重建 compose 文件里有 `build:` 段的服务。`control-plane` 的镜像名是 `sandbox/control-plane:v1`，compose 里没用 `build:`，所以改完 `server/Dockerfile` 必须显式 `docker build` 再 `compose up`（`rebuild_p1_images.py` / `deploy_server.py` 都处理了）。
 
+### 8.8 `templateID` 支持 name / code 双解析（2026-09-29 修复）
+早期版本 `POST /sandboxes` 只认模板 code，传 `"code-interpreter"` 这类 name 会 404 `100002`。现已支持：code 查不到时自动按 `name` 回退（`store.get_template_by_name`），`GET /templates/{code}` 同样支持 name。历史文档/脚本里"必须先查 `/v2/templates` 换算 code"的步骤可以省略。
+
+### 8.9 health 总 `ok` 按 features 聚合（2026-09-29 修复）
+早期版本总 `ok` 恒把 envd / jupyter / browser 三探针全部 AND，导致无 browser 能力的模板（如 code-interpreter）总 `ok` 永远 false。现按沙箱 `features` 聚合：未启用的服务探针返回 `null`，不计入 `ok`。**总 `.ok` 可直接作为就绪判据**（code-interpreter 实测 ~200ms；带 browser 的模板 Chromium 启动需 30-60s）。
+
+### 8.10 开发机到服务器 443 被网关拦截时的绕行方案
+开发机与服务器不同网段时，出站 `443` / `20000-21000` 可能被中间网关丢弃（`8902` 正常；服务器本机与 firewalld 均无问题，`*.nip.io` DNS 解析也正常——卡的是 TCP 443）。这会让 edge-proxy 数据面（run_code / files / CDP）全部超时，**官方 SDK 同样受影响**。规避：SSH 隧道把本地端口转发到服务器 `:443`，再覆写 `Host` 头为 `{port}-{sid}.{DOMAIN}`（edge-proxy 只按 Host 头路由，见 §11.1 curl 示例）。`tests/bubble_sort_demo.py --tunnel` 已实现该模式，可直接复用。
+
 ---
 
 ## 9. 与百炼 / 原版 E2B 的已知差异
@@ -1266,6 +1338,13 @@ docker logs sandbox-control-plane --tail 50
 - 检查 `NODE_EXTRA_CA_CERTS` 指向了 `certs/ca.pem`
 - 直接用 `webSocketDebuggerUrl` 字段（`/json/version` 返回的），不要自己拼
 
+**创建沙箱 404（100002）**
+- `templateID` 既不是已注册模板的 code 也不是 name（name 回退自 2026-09-29 支持，见 §8.8）。用 `GET /v2/templates` 确认注册情况
+
+**数据面（run_code / files / CDP）连接超时，但 8902 正常**
+- `*.nip.io` DNS 能解析不代表能连通；先 `Test-NetConnection {IP} -Port 443`（或 raw socket）确认 TCP 层
+- 跨网段网关丢弃 443 时，走 SSH 隧道 + `Host` 头覆写（见 §8.10，`tests/bubble_sort_demo.py --tunnel` 有现成实现）
+
 ---
 
 ## 11. 给 Agent 的最后提示
@@ -1273,7 +1352,7 @@ docker logs sandbox-control-plane --tail 50
 ### 11.1 工作约定（按优先级）
 
 1. **优先用封装好的 Session API**（§4.3 方式 A），不要自己拼 CDP 调用
-2. **创建沙箱后等 health 轮询**返回 `ok: true` 再开始用（Chromium 启动慢，要 30-60 秒）
+2. **创建沙箱后等 health 轮询总 `ok`**（按 features 聚合，见 §8.9）：code-interpreter ~200ms；带 browser 的模板 Chromium 启动慢，要 30-60 秒
 3. **销毁比创建便宜**——不要复用一个脏沙箱，用完就 `kill()`
 4. **pause 不等于 kill**——pause 后沙箱还在（占端口 / 占配额），不用就 `kill()`
 5. **每个任务新开沙箱**——脏数据 + 内存膨胀让复用得不偿失

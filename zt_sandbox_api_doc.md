@@ -22,6 +22,8 @@
 
 错误响应统一为 JSON `{code, message, requestID}`，详见 §9。
 
+> **数据面连通性**：edge-proxy 子域走 TCP 443。若客户端与服务器跨网段且中间网关丢弃 443（现象：`8902` 正常、`*.nip.io` 解析正常、但 443 连接超时，官方 SDK 同样受影响），可 SSH 隧道转发到服务器 `:443`，请求覆写 `Host: {port}-{sandboxID}.{DOMAIN}`——edge-proxy 只按 Host 头路由，见 §11.1 与 README §8.10。
+
 ---
 
 ## 1. 鉴权模型
@@ -133,7 +135,7 @@ curl -H "X-API-KEY: sk-xxx..." http://host:8902/v2/templates
 
 | 字段 | 类型 | 必填 | 默认 | 说明 |
 |---|---|---|---|---|
-| `templateID` | string | ✓ | — | 模板 code 或 alias（alias 当前不支持解析，必须传 code） |
+| `templateID` | string | ✓ | — | 模板 code（`tmpl...`）或 name（如 `code-interpreter`）；code 查不到时按 name 回退（2026-09-29 起支持） |
 | `timeout` | int | ✗ | `600` | TTL 秒 |
 | `metadata` | object | ✗ | `{}` | 自定义标签，原样存储 |
 | `env_vars` | object | ✗ | `{}` | 覆盖模板 envVars |
@@ -186,18 +188,21 @@ curl -H "X-API-KEY: sk-xxx..." http://host:8902/v2/templates
 
 ### 3.3 `GET /sandboxes/{sandbox_id}/health` 健康快照
 
-**响应** `200`：
+**响应** `200`（逐探针实测结构；示例为 code-interpreter 模板，browser 未启用 → `null`）：
 ```json
 {
   "sandboxID": "sbx...",
   "state": "running",
   "containerRunning": true,
-  "envdReady": true,
-  "browserReady": false,
-  "endAt": "2026-09-29T10:42:11Z",
-  "lastActivity": "2026-09-29T09:45:02Z"
+  "envd":    { "port": 20000, "ok": true, "detail": {"ok": true} },
+  "jupyter": { "port": 20001, "ok": true, "detail": {"ok": true, "service": "jupyter", "contexts": 0} },
+  "browser": null,
+  "ok": true
 }
 ```
+
+- 每个探针 `GET http://127.0.0.1:{hostPort}/health`（3s 超时）。
+- 总 `ok` 按沙箱 `features` 聚合（2026-09-29 起）：未启用的服务探针为 `null`，不计入 AND。**总 `.ok` 可直接作为就绪判据**——code-interpreter 实测 create 返回后约 200ms 就绪；带 browser 的模板 Chromium 启动需 30-60s。
 
 ### 3.4 `GET /v2/sandboxes` 列表
 
@@ -454,7 +459,28 @@ E2B 官方 SDK 直接走这套，自定义客户端可用 JSON body（自动转 
 
 ### 8.5 Jupyter 内核（port 49999）
 
-兼容 `e2b_code_interpreter` SDK，无需手写 HTTP。
+兼容 `e2b_code_interpreter` SDK，无需手写 HTTP。不引 SDK 时可直接调以下端点（均需 `x-access-token`）：
+
+| 端点 | 用途 |
+|---|---|
+| `POST /execute` | 执行代码，响应为 **NDJSON 流**（每行一个事件） |
+| `GET /contexts` | 列出内核 context |
+| `POST /contexts` | 新建 context（body 可选 `{"cwd": "..."}`），返回 `{"id","language","cwd"}` |
+| `DELETE /contexts/{id}` | 销毁 context（内核进程随之退出） |
+| `POST /contexts/{id}/restart` | 重启内核 |
+
+`POST /execute` 请求体：`{"code": "...", "context_id": "default"}`（`context_id` 缺省为 `default`，首次调用自动冷启动 IPython kernel）。
+
+NDJSON 事件类型：
+
+| `type` | 字段 | 说明 |
+|---|---|---|
+| `stdout` / `stderr` | `text`, `timestamp` | 流式输出 |
+| `result` | `text` / `html` / `png` 等（按 MIME 映射） | 表达式求值结果 |
+| `error` | `name`, `value`, `traceback` | 异常 |
+| `number_of_executions` | `execution_count` | 执行序号 |
+
+实测时延（500 元素负载，见 README §6 基线）：首次执行约 **1.0s**（含 kernel 冷启动 ~0.8s），同一 context 内热执行约 **240ms**。单次超 120s 无输出会收到 `TimeoutError` 事件。
 
 ### 8.6 Browser CDP（port 3000）
 
@@ -554,10 +580,14 @@ WebSocket 升级经过 edge-proxy 透明转发；session 绑定的沙箱需要�
 ```bash
 HOST=${SBX_HOST}; API=${SBX_API_KEY}; SESSION="chat-A-$(date +%s)"
 
+# templateID 必须是 tmpl... code，模板名不解析（传 name 会 404 100002）
+TID=$(curl -sS http://$HOST:8902/v2/templates -H "Authorization: Bearer $API" \
+  | jq -r '.[] | select(.name=="code-interpreter") | .templateID')
+
 # create
 RESP=$(curl -sS -X POST http://$HOST:8902/sandboxes \
   -H "Authorization: Bearer $API" -H "Content-Type: application/json" \
-  -d "{\"templateID\":\"code-interpreter\",\"sessionId\":\"$SESSION\",\"timeout\":300}")
+  -d "{\"templateID\":\"$TID\",\"sessionId\":\"$SESSION\",\"timeout\":300}")
 SBX=$(echo $RESP | jq -r .sandboxID)
 TOK=$(echo $RESP | jq -r .envdAccessToken)
 DOMAIN=$(echo $RESP | jq -r .domain)

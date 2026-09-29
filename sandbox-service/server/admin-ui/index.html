@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sandbox 管理面板</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232EA7FF' stroke-width='2'%3E%3Cpath d='M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 1 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="styles.css">
+<script src="app.js" defer></script>
+</head>
+<body>
+
+<div class="orbs" aria-hidden="true">
+  <i class="orb orb-a"></i><i class="orb orb-b"></i><i class="orb orb-c"></i>
+</div>
+
+<!-- ============ 登录视图 ============ -->
+<section id="view-login" class="view view-login">
+  <div class="login-card glass">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" class="brand-mark"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+      <span>Sandbox 控制面</span>
+    </div>
+    <h1>管理面板</h1>
+    <p class="sub">登录以管理 API Key 与运行中的沙箱实例</p>
+    <form id="login-form" novalidate>
+      <div class="field">
+        <label for="login-user">用户名</label>
+        <input id="login-user" name="username" type="text" autocomplete="username"
+               spellcheck="false" required placeholder="管理员用户名">
+      </div>
+      <div class="field">
+        <label for="login-pass">密码</label>
+        <input id="login-pass" name="password" type="password" autocomplete="current-password"
+               required placeholder="管理员密码">
+        <p id="login-error" class="field-error" hidden></p>
+      </div>
+      <button type="submit" class="btn btn-primary btn-block" id="login-btn">
+        <svg viewBox="0 0 24 24" class="ico"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+        <span>登录</span>
+      </button>
+    </form>
+  </div>
+</section>
+
+<!-- ============ 仪表盘视图 ============ -->
+<section id="view-dash" class="view view-dash" hidden>
+  <header class="topbar glass">
+    <div class="brand">
+      <svg viewBox="0 0 24 24" class="brand-mark"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+      <span>Sandbox <em>管理面板</em></span>
+    </div>
+    <div class="topbar-right">
+      <span class="chip" title="会话剩余时间">
+        <svg viewBox="0 0 24 24" class="ico"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
+        <span id="session-timer">—</span>
+      </span>
+      <button class="btn btn-ghost" id="logout-btn">
+        <svg viewBox="0 0 24 24" class="ico"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+        <span>退出</span>
+      </button>
+    </div>
+  </header>
+
+  <main class="bento">
+    <!-- 容量总览 -->
+    <section class="tile glass span-5" aria-labelledby="t-cap">
+      <div class="tile-head">
+        <svg viewBox="0 0 24 24" class="ico accent"><path d="M22 12H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+        <h2 id="t-cap">容量总览</h2>
+      </div>
+      <div id="cap-body" class="cap-body">
+        <div class="cap-counts"><span class="skeleton sk-line w-40"></span></div>
+      </div>
+    </section>
+
+    <!-- 服务状态 -->
+    <section class="tile glass span-3" aria-labelledby="t-svc">
+      <div class="tile-head">
+        <svg viewBox="0 0 24 24" class="ico accent"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <h2 id="t-svc">服务状态</h2>
+      </div>
+      <ul id="svc-list" class="svc-list"><li><span class="skeleton sk-line w-60"></span></li></ul>
+    </section>
+
+    <!-- Key 统计 -->
+    <section class="tile glass span-4" aria-labelledby="t-kstat">
+      <div class="tile-head">
+        <svg viewBox="0 0 24 24" class="ico accent"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+        <h2 id="t-kstat">凭证概览</h2>
+      </div>
+      <div id="kstat-body" class="kstat-body">
+        <span class="skeleton sk-line w-40"></span>
+      </div>
+    </section>
+
+    <!-- API Key 管理 -->
+    <section class="tile glass span-7" aria-labelledby="t-keys">
+      <div class="tile-head">
+        <svg viewBox="0 0 24 24" class="ico accent"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+        <h2 id="t-keys">API Key 管理</h2>
+        <button class="btn btn-ghost btn-sm" id="keys-refresh" title="刷新">
+          <svg viewBox="0 0 24 24" class="ico"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        </button>
+      </div>
+      <form id="key-create-form" class="key-form" novalidate>
+        <div class="field inline"><label for="kc-owner">Owner</label>
+          <input id="kc-owner" type="text" placeholder="如 alice" required></div>
+        <div class="field inline"><label for="kc-tenant">Tenant</label>
+          <input id="kc-tenant" type="text" placeholder="如 acme" required></div>
+        <div class="field inline"><label for="kc-label">备注</label>
+          <input id="kc-label" type="text" placeholder="可选"></div>
+        <button type="submit" class="btn btn-primary btn-sm">
+          <svg viewBox="0 0 24 24" class="ico"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+          <span>新建 Key</span>
+        </button>
+      </form>
+      <div id="keys-list" class="list" aria-live="polite">
+        <div class="skeleton sk-row"></div><div class="skeleton sk-row"></div>
+      </div>
+    </section>
+
+    <!-- 沙箱实例 -->
+    <section class="tile glass span-5" aria-labelledby="t-sbx">
+      <div class="tile-head">
+        <svg viewBox="0 0 24 24" class="ico accent"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+        <h2 id="t-sbx">沙箱实例</h2>
+        <button class="btn btn-ghost btn-sm" id="sbx-refresh" title="刷新">
+          <svg viewBox="0 0 24 24" class="ico"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+        </button>
+      </div>
+      <p class="tile-note">每 15 秒自动刷新</p>
+      <div id="sbx-list" class="list" aria-live="polite">
+        <div class="skeleton sk-row"></div><div class="skeleton sk-row"></div>
+      </div>
+    </section>
+  </main>
+</section>
+
+<div id="modal-root" hidden></div>
+<div id="toast-root" aria-live="polite" class="toast-root"></div>
+
+</body>
+</html>

@@ -49,6 +49,8 @@ env_content = f"API_KEYS={api_keys_csv}\nSANDBOX_DOMAIN={DOMAIN}\n"
 if API_KEYS_JSON:
     env_content += f"API_KEYS_JSON={API_KEYS_JSON}\n"
 env_content += f"ADMIN_TOKEN={ADMIN_TOKEN}\n"
+# P4 第七刀: 管理面板登录凭据与 SSH 凭据保持一致（用户要求）。
+env_content += f"ADMIN_USER={USER}\nADMIN_PASSWORD={PWD}\n"
 EXTRA = {
     "deploy/.env": env_content,
 }

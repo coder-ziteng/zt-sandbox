@@ -15,6 +15,9 @@ services:
       API_KEYS: "${API_KEYS:-}"
       API_KEYS_JSON: "${API_KEYS_JSON:-}"
       ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
+      # P4 第七刀: 管理面板登录凭据 (= SBX_SSH_USER / SBX_SSH_PASSWORD)
+      ADMIN_USER: "${ADMIN_USER:-}"
+      ADMIN_PASSWORD: "${ADMIN_PASSWORD:-}"
       SANDBOX_DOMAIN: "${SANDBOX_DOMAIN:-192.168.2.162.nip.io}"
       CRIU_ENABLED: "${CRIU_ENABLED:-auto}"
       CHECKPOINT_DIR: "/var/lib/sbx-checkpoints"

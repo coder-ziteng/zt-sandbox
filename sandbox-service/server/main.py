@@ -3,6 +3,8 @@
 P1: browser / all-in-one templates (container port 3000) + /health polling.
 P2: network allowlist per template, CRIU-aware pause/resume, admission control (quota).
 """
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -14,6 +16,7 @@ import diagnostics
 import metrics
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 import store
 import runtime
@@ -26,6 +29,12 @@ API_KEYS = [k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip()
 # endpoints. Operators configure it via the ADMIN_TOKEN env var (long random
 # string); rotate by restarting the control plane with a new value.
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+# P4 第七刀: 管理面板登录凭据 — 由 deploy_server.py 从 SBX_SSH_USER /
+# SBX_SSH_PASSWORD 写入 deploy/.env。登录成功后签发以 ADMIN_TOKEN 为密钥的
+# HMAC 短效 session token，浏览器永远接触不到 ADMIN_TOKEN 本身。
+ADMIN_USER = os.getenv("ADMIN_USER", "").strip()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "").strip()
+ADMIN_SESSION_TTL_S = int(os.getenv("ADMIN_SESSION_TTL_S", "28800"))  # 8h
 SANDBOX_DOMAIN = os.getenv("SANDBOX_DOMAIN", "192.168.2.162.nip.io")
 ENVD_VERSION = "0.7.0"
 MAX_SANDBOXES = int(os.getenv("MAX_SANDBOXES", "24"))
@@ -110,10 +119,14 @@ async def auth(request: Request, call_next):
     path = request.url.path
     if path.startswith("/admin"):
         # /admin/* uses a separate credential — never the data-plane API key.
+        # P4 第七刀: 登录入口与管理面板静态资源豁免; 其余仍要求
+        # ADMIN_TOKEN 或有效签名的 session token (数据面 key 依旧被拒)。
+        if path == "/admin/login" or path.startswith("/admin/ui"):
+            return await call_next(request)
         if not ADMIN_TOKEN:
             return err(100012, "admin 未启用: 未设置 ADMIN_TOKEN", 503)
         presented = request.headers.get("x-admin-token", "") or _bearer(request)
-        if not presented or presented != ADMIN_TOKEN:
+        if not presented or (presented != ADMIN_TOKEN and not _verify_session(presented)):
             return err(100012, "admin 凭证无效", 401)
         return await call_next(request)
     if path in ("/health", "/metrics", "/") or path.startswith("/internal"):
@@ -298,6 +311,142 @@ def admin_revoke_key(key_id: str):
     return {"id": key_id, "revoked": True}
 
 
+# ---------------- /admin panel (P4 第七刀 — 管理面板) ----------------
+
+def _session_sig(exp: int) -> str:
+    return hmac.new(ADMIN_TOKEN.encode(), f"sbxsess.{exp}".encode(), hashlib.sha256).hexdigest()
+
+
+def _issue_session() -> tuple[str, int]:
+    exp = int(time.time()) + ADMIN_SESSION_TTL_S
+    return f"sbxsess.{exp}.{_session_sig(exp)}", exp
+
+
+def _verify_session(token: str) -> bool:
+    """Validate `sbxsess.<exp>.<hmac>` — signed with ADMIN_TOKEN as key."""
+    if not ADMIN_TOKEN or not token.startswith("sbxsess."):
+        return False
+    parts = token.split(".")
+    if len(parts) != 3:
+        return False
+    try:
+        exp = int(parts[1])
+    except ValueError:
+        return False
+    if exp <= time.time():
+        return False
+    return hmac.compare_digest(_session_sig(exp), parts[2])
+
+
+@app.post("/admin/login")
+async def admin_login(request: Request):
+    """Panel entry: verify ADMIN_USER/ADMIN_PASSWORD (= SBX_SSH_USER/PASSWORD
+    wired by deploy_server.py) and return a short-lived signed session token.
+    The browser never sees ADMIN_TOKEN itself."""
+    if not ADMIN_TOKEN or not ADMIN_USER or not ADMIN_PASSWORD:
+        return err(100012, "管理面板未启用: 缺少 ADMIN_TOKEN/ADMIN_USER/ADMIN_PASSWORD", 503)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    username = str(body.get("username") or "")
+    password = str(body.get("password") or "")
+    ok_user = hmac.compare_digest(username, ADMIN_USER)
+    ok_pass = hmac.compare_digest(password, ADMIN_PASSWORD)
+    if not (ok_user and ok_pass):
+        log.warning("admin login failed for user %r from %s", username,
+                    request.client.host if request.client else "?")
+        return err(100012, "用户名或密码无效", 401)
+    token, exp = _issue_session()
+    log.info("admin session issued for %r (expires %s)", username, iso(exp))
+    return {"token": token, "expiresAt": exp}
+
+
+def _admin_sandbox_json(row: dict) -> dict:
+    d = sandbox_json(row, with_token=False)
+    d.pop("envdAccessToken", None)
+    d["owner"] = row.get("owner") or "default"
+    d["tenant"] = row.get("tenant") or "default"
+    return d
+
+
+@app.get("/admin/sandboxes")
+def admin_list_sandboxes():
+    """Full inventory across all owners/tenants (admin view, no envd tokens)."""
+    rows = store.list_sandboxes(("running", "paused"))
+    return {"sandboxes": [_admin_sandbox_json(r) for r in rows]}
+
+
+@app.post("/admin/sandboxes/{sandbox_id}/pause")
+async def admin_pause_sandbox(sandbox_id: str, request: Request):
+    row = store.get_sandbox(sandbox_id)
+    if not row:
+        return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    if row["state"] == "paused":
+        return Response(status_code=409)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    use_criu = str(body.get("criu", "auto")).lower() in ("1", "true", "auto", "yes")
+    mode = "stop"
+    if use_criu and runtime.criu_available():
+        if runtime.checkpoint_container(sandbox_id):
+            mode = "criu"
+        else:
+            log.warning("CRIU checkpoint failed for %s, using docker stop", sandbox_id)
+    if mode == "stop":
+        runtime.stop_container(sandbox_id)
+    store.update_sandbox(sandbox_id, state="paused", pause_mode=mode)
+    metrics.SANDBOX_ACTIVE.labels(state="running").dec()
+    metrics.SANDBOX_ACTIVE.labels(state="paused").inc()
+    log.info("admin paused sandbox %s (mode=%s)", sandbox_id, mode)
+    return Response(status_code=204)
+
+
+@app.post("/admin/sandboxes/{sandbox_id}/resume")
+async def admin_resume_sandbox(sandbox_id: str, request: Request):
+    row = store.get_sandbox(sandbox_id)
+    if not row:
+        return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    timeout = int(body.get("timeout") or 300)
+    tpl = store.get_template(row["template_code"])
+    ok, msg = _resume_data_plane(row, tpl)
+    if not ok:
+        return err(100006, msg, 404 if "不存在" in msg else 503)
+    store.update_sandbox(sandbox_id, state="running", end_at=time.time() + timeout,
+                         last_activity=time.time())
+    row = store.get_sandbox(sandbox_id)
+    metrics.SANDBOX_ACTIVE.labels(state="paused").dec()
+    metrics.SANDBOX_ACTIVE.labels(state="running").inc()
+    log.info("admin resumed sandbox %s", sandbox_id)
+    return _admin_sandbox_json(row)
+
+
+@app.delete("/admin/sandboxes/{sandbox_id}")
+def admin_kill_sandbox(sandbox_id: str):
+    row = store.get_sandbox(sandbox_id)
+    if not row:
+        return Response(status_code=404)
+    prev_state = row.get("state", "running")
+    runtime.remove_container(sandbox_id)
+    store.delete_sandbox(sandbox_id)
+    log.info("admin killed sandbox %s", sandbox_id)
+    metrics.SANDBOX_DESTROYED.labels(reason="admin").inc()
+    if prev_state in ("running", "paused"):
+        metrics.SANDBOX_ACTIVE.labels(state=prev_state).dec()
+    return Response(status_code=204)
+
+
+_UI_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin-ui")
+if os.path.isdir(_UI_DIR):
+    app.mount("/admin/ui", StaticFiles(directory=_UI_DIR, html=True), name="admin-ui")
+
+
 @app.post("/sandboxes")
 async def create_sandbox(request: Request):
     try:
@@ -307,7 +456,7 @@ async def create_sandbox(request: Request):
     template_id = body.get("templateID") or body.get("template_id")
     if not template_id:
         return err(100004, "参数缺失: templateID", 400)
-    tpl = store.get_template(template_id)
+    tpl = store.get_template(template_id) or store.get_template_by_name(template_id)
     if not tpl:
         return err(100002, f"模版不存在: {template_id}", 404)
 
@@ -441,13 +590,14 @@ def sandbox_health(sandbox_id: str, request: Request):
         except Exception as e:
             return {"port": port, "ok": False, "error": str(e)}
 
+    features = row.get("features") or "envd,jupyter"
     out = {
         "sandboxID": sandbox_id,
         "state": row["state"],
         "containerRunning": runtime.container_running(sandbox_id),
         "envd": probe(row["host_port_envd"]),
-        "jupyter": probe(row["host_port_jupyter"]),
-        "browser": probe(row.get("host_port_browser")),
+        "jupyter": probe(row["host_port_jupyter"]) if "jupyter" in features else None,
+        "browser": probe(row.get("host_port_browser")) if "browser" in features else None,
     }
     out["ok"] = all(
         (v is None or v["ok"]) for k, v in out.items() if k in ("envd", "jupyter", "browser")
@@ -802,7 +952,7 @@ def list_templates():
 
 @app.get("/templates/{template_code}")
 def get_template(template_code: str):
-    t = store.get_template(template_code)
+    t = store.get_template(template_code) or store.get_template_by_name(template_code)
     if not t:
         return err(100002, f"模版不存在: {template_code}", 404)
     return {"templateCode": t["code"], "templateID": t["code"], "name": t["name"], "image": t["image"],

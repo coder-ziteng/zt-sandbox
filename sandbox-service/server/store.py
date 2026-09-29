@@ -174,6 +174,12 @@ def get_template(code: str):
     return dict(row) if row else None
 
 
+def get_template_by_name(name: str):
+    with db() as c:
+        row = c.execute("SELECT * FROM templates WHERE name=? LIMIT 1", (name,)).fetchone()
+    return dict(row) if row else None
+
+
 def update_template_hooks(code: str, startup_hooks: list = None, periodic_hooks: list = None) -> bool:
     """Replace hook lists on a template. Either arg may be None to leave unchanged."""
     sets, vals = [], []
