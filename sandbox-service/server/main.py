@@ -24,6 +24,8 @@ SANDBOX_DOMAIN = os.getenv("SANDBOX_DOMAIN", "192.168.2.162.nip.io")
 ENVD_VERSION = "0.7.0"
 MAX_SANDBOXES = int(os.getenv("MAX_SANDBOXES", "24"))
 MAX_MEMORY_MB = int(os.getenv("MAX_MEMORY_MB", "6144"))
+HOOK_TICK_S = int(os.getenv("HOOK_TICK_S", "30"))
+NETPOLICY_REFRESH_S = int(os.getenv("NETPOLICY_REFRESH_S", "300"))  # 5min
 
 app = FastAPI(title="sandbox-service", docs_url=None, redoc_url=None)
 store.init_db()
@@ -79,6 +81,9 @@ def sandbox_json(row: dict, with_token: bool = True) -> dict:
         d["browserPort"] = 3000
     if with_token:
         d["envdAccessToken"] = row["envd_token"]
+    hs = json.loads(row.get("hook_state") or "{}")
+    if hs:
+        d["hookState"] = hs
     return d
 
 
@@ -135,8 +140,31 @@ async def create_sandbox(request: Request):
     if "browser" in features and not runtime.wait_browser(ports[2], timeout_s=60.0):
         log.warning("browser health check timeout for %s (continuing)", sandbox_id)
 
+    # P3: startup hooks (fail-closed on blocking failure)
+    startup_hooks = json.loads(tpl.get("startup_hooks") or "[]")
+    hook_state = {}
+    if startup_hooks:
+        log.info("running %d startup hooks for %s", len(startup_hooks), sandbox_id)
+        res = runtime.run_startup_hooks(sandbox_id, startup_hooks)
+        hook_state["startup"] = {
+            "ran_at": time.time(),
+            "all_passed": res["all_passed"],
+            "blocking_failures": res["blocking_failures"],
+            "results": res["results"],
+        }
+        if not res["all_passed"]:
+            log.warning("startup hooks failed for %s (blocking=%s) — tearing down",
+                        sandbox_id, res["blocking_failures"])
+            runtime.remove_container(sandbox_id)
+            store.delete_sandbox(sandbox_id)
+            return err(100010,
+                       f"启动钩子失败: {res['blocking_failures']}; sandbox 已回滚",
+                       500)
+
     store.create_sandbox(sandbox_id, template_id, client_id, envd_token, list(ports), metadata,
                          f"sbx-{sandbox_id}", timeout, features=features)
+    if hook_state:
+        store.update_sandbox(sandbox_id, hook_state=json.dumps(hook_state))
     row = store.get_sandbox(sandbox_id)
     log.info("created sandbox %s ports=%s features=%s ttl=%ss", sandbox_id, ports, features, timeout)
     return JSONResponse(sandbox_json(row, with_token=True), status_code=201)
@@ -348,10 +376,64 @@ async def set_netpolicy(sandbox_id: str, request: Request):
     return netpolicy.apply(sandbox_id, ip, body)
 
 
+@app.post("/sandboxes/{sandbox_id}/netpolicy/refresh")
+def refresh_netpolicy(sandbox_id: str):
+    """P3: manually trigger FQDN re-resolution (e.g. for CDN rotation)."""
+    row = store.get_sandbox(sandbox_id)
+    if not row:
+        return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    r = netpolicy.refresh(sandbox_id)
+    if r is None:
+        return {"sandboxID": sandbox_id, "skipped": True,
+                "reason": "no active allowlist (open/blocked mode or sandbox torn down)"}
+    return r
+
+
 @app.delete("/sandboxes/{sandbox_id}/netpolicy")
 def del_netpolicy(sandbox_id: str):
     ip = runtime.container_ip(sandbox_id)
     return netpolicy.revoke(sandbox_id, ip)
+
+
+@app.post("/internal/auto-resume")
+async def internal_auto_resume(request: Request):
+    """P3 ingress keepalive: triggered by edge proxy when upstream connection
+    fails. Synchronously restores the sandbox so the very next retry succeeds."""
+    sandbox_id = request.query_params.get("sandbox")
+    if not sandbox_id:
+        return err(100004, "missing sandbox param", 400)
+    row = store.get_sandbox(sandbox_id)
+    if not row:
+        return err(100003, f"sandbox not found: {sandbox_id}", 404)
+    if row["state"] == "running":
+        return {"ok": True, "alreadyRunning": True}
+    if row["state"] != "paused":
+        return err(100005, f"sandbox state={row['state']}, cannot auto-resume", 409)
+    tpl = store.get_template(row["template_code"])
+    ok, msg = _resume_data_plane(row, tpl)
+    if not ok:
+        return err(100006, msg, 503)
+    store.update_sandbox(sandbox_id, state="running", last_activity=time.time())
+    log.info("auto-resumed sandbox %s via ingress keepalive trigger", sandbox_id)
+    return {"ok": True}
+
+
+# ---------------- hooks (P3) ----------------
+
+@app.get("/sandboxes/{sandbox_id}/hooks/status")
+def sandbox_hook_status(sandbox_id: str):
+    row = store.get_sandbox(sandbox_id)
+    if not row:
+        return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    tpl = store.get_template(row["template_code"])
+    hs = json.loads(row.get("hook_state") or "{}")
+    return {
+        "sandboxID": sandbox_id,
+        "templateCode": row["template_code"],
+        "configuredStartupHooks": json.loads(tpl.get("startup_hooks") or "[]") if tpl else [],
+        "configuredPeriodicHooks": json.loads(tpl.get("periodic_hooks") or "[]") if tpl else [],
+        "hookState": hs,
+    }
 
 
 # ---------------- templates ----------------
@@ -367,12 +449,20 @@ async def create_template(request: Request):
     envs = body.get("envVars") or {}
     browser = bool(body.get("browserEnabled"))
     net = body.get("networkPolicy") or {"mode": "open"}
-    code = store.create_template(name, image, cpu, mem, disk, envs, browser_enabled=browser, network_policy=net)
+    startup_hooks = body.get("startupHooks") or []
+    periodic_hooks = body.get("periodicHooks") or []
+    code = store.create_template(name, image, cpu, mem, disk, envs,
+                                  browser_enabled=browser, network_policy=net,
+                                  startup_hooks=startup_hooks, periodic_hooks=periodic_hooks)
     tpl = store.get_template(code)
-    log.info("created template %s (browser=%s net=%s)", code, tpl["browser_enabled"], tpl["network_policy"])
+    log.info("created template %s (browser=%s net=%s hooks_startup=%d periodic=%d)",
+             code, tpl["browser_enabled"], tpl["network_policy"],
+             len(startup_hooks), len(periodic_hooks))
     return JSONResponse({
         "templateCode": code, "templateID": code, "name": name, "image": image,
         "browserEnabled": bool(tpl["browser_enabled"]), "networkPolicy": json.loads(tpl["network_policy"]),
+        "startupHooks": json.loads(tpl.get("startup_hooks") or "[]"),
+        "periodicHooks": json.loads(tpl.get("periodic_hooks") or "[]"),
     }, status_code=201)
 
 
@@ -383,7 +473,9 @@ def list_templates():
         out.append({"templateCode": t["code"], "templateID": t["code"], "name": t["name"], "image": t["image"],
                     "cpuCount": t["cpu_count"], "memoryMB": t["memory_mb"], "version": t["version"],
                     "browserEnabled": bool(t.get("browser_enabled")),
-                    "networkPolicy": json.loads(t.get("network_policy") or "{}")})
+                    "networkPolicy": json.loads(t.get("network_policy") or "{}"),
+                    "startupHooks": json.loads(t.get("startup_hooks") or "[]"),
+                    "periodicHooks": json.loads(t.get("periodic_hooks") or "[]")})
     return out
 
 
@@ -395,7 +487,40 @@ def get_template(template_code: str):
     return {"templateCode": t["code"], "templateID": t["code"], "name": t["name"], "image": t["image"],
             "cpuCount": t["cpu_count"], "memoryMB": t["memory_mb"], "diskSizeMB": t["disk_size_mb"],
             "version": t["version"], "browserEnabled": bool(t.get("browser_enabled")),
-            "networkPolicy": json.loads(t.get("network_policy") or "{}")}
+            "networkPolicy": json.loads(t.get("network_policy") or "{}"),
+            "startupHooks": json.loads(t.get("startup_hooks") or "[]"),
+            "periodicHooks": json.loads(t.get("periodic_hooks") or "[]")}
+
+
+@app.get("/templates/{template_code}/hooks")
+def get_template_hooks(template_code: str):
+    t = store.get_template(template_code)
+    if not t:
+        return err(100002, f"模版不存在: {template_code}", 404)
+    return {"templateCode": t["code"],
+            "startupHooks": json.loads(t.get("startup_hooks") or "[]"),
+            "periodicHooks": json.loads(t.get("periodic_hooks") or "[]")}
+
+
+@app.put("/templates/{template_code}/hooks")
+async def put_template_hooks(template_code: str, request: Request):
+    t = store.get_template(template_code)
+    if not t:
+        return err(100002, f"模版不存在: {template_code}", 404)
+    body = await request.json()
+    startup_hooks = body.get("startupHooks")
+    periodic_hooks = body.get("periodicHooks")
+    if startup_hooks is None and periodic_hooks is None:
+        return err(100004, "startupHooks / periodicHooks 至少传一个", 400)
+    store.update_template_hooks(template_code,
+                                startup_hooks=startup_hooks,
+                                periodic_hooks=periodic_hooks)
+    t = store.get_template(template_code)
+    log.info("updated hooks template %s startup=%d periodic=%d",
+             template_code, len(startup_hooks or []), len(periodic_hooks or []))
+    return {"templateCode": t["code"],
+            "startupHooks": json.loads(t.get("startup_hooks") or "[]"),
+            "periodicHooks": json.loads(t.get("periodic_hooks") or "[]")}
 
 
 @app.delete("/templates/{template_code}")
@@ -444,5 +569,54 @@ async def start_scheduler():
                 log.exception("reaper error")
             await asyncio.sleep(15)
 
+    async def periodic_hooks_loop():
+        """P3: dispatch periodic hooks (best-effort) for all live sandboxes."""
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                await loop.run_in_executor(None, _run_periodic_for_all)
+            except Exception:
+                log.exception("periodic hook loop error")
+            await asyncio.sleep(HOOK_TICK_S)
+
+    async def netpolicy_refresh_loop():
+        """P3: re-resolve FQDN allowlist so CDN rotation doesn't blackhole
+        sandbox egress. Default 5min, override via NETPOLICY_REFRESH_S."""
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                refreshed = await loop.run_in_executor(None, netpolicy.refresh_all)
+                if refreshed:
+                    log.info("netpolicy refresh: %d sandboxes updated", len(refreshed))
+            except Exception:
+                log.exception("netpolicy refresh error")
+            await asyncio.sleep(NETPOLICY_REFRESH_S)
+
     asyncio.create_task(warmup())
     asyncio.create_task(reaper())
+    asyncio.create_task(periodic_hooks_loop())
+    asyncio.create_task(netpolicy_refresh_loop())
+
+
+def _run_periodic_for_all():
+    """Synchronous periodic hook dispatcher (runs in thread pool)."""
+    now = time.time()
+    for row in store.list_sandboxes(("running",)):
+        try:
+            tpl = store.get_template(row["template_code"])
+            if not tpl:
+                continue
+            periodic = json.loads(tpl.get("periodic_hooks") or "[]")
+            if not periodic:
+                continue
+            hs = json.loads(row.get("hook_state") or "{}")
+            pstate = hs.get("periodic", {}).get("hooks", {}) or {}
+            res = runtime.run_periodic_hooks(row["sandbox_id"], periodic, pstate, now)
+            if res["ran"]:
+                hs.setdefault("periodic", {})
+                hs["periodic"]["hooks"] = res["state"]
+                hs["periodic"]["last_tick"] = now
+                store.update_sandbox(row["sandbox_id"], hook_state=json.dumps(hs))
+                log.info("periodic hooks ran on %s: %s", row["sandbox_id"], res["ran"])
+        except Exception:
+            log.exception("periodic hooks failed for %s", row.get("sandbox_id"))

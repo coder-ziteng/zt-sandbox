@@ -30,6 +30,60 @@
 
 ---
 
+## 0.1 选哪种入口（决策树）
+
+| 你的场景 | 推荐入口 | 章节 |
+|---|---|---|
+| Claude Code / Cursor 中让 Agent 直接跑代码 | **MCP**（stdio，`mcp_server.py`） | §4.7 |
+| 已有 Python 代码、想用官方 SDK | **E2B SDK** | §4.1 |
+| 已有 Node / Go / Java 代码、不想引 SDK | **REST + ConnectRPC JSON** | §4.6 方式 B |
+| 想用 Playwright 跑浏览器 | **CDP 直连**（从 `webSocketDebuggerUrl`） | §4.3 方式 B |
+| 只想批量执行、不想引入 SDK | **REST**（`Authorization: Bearer`） | §4.6 方式 B |
+
+---
+
+## 0.2 30 秒上手（Copy-Paste）
+
+**A. 纯 REST（不依赖任何 SDK）**
+```bash
+curl -sS http://${SBX_SSH_HOST}:8902/health \
+  -H "Authorization: Bearer ${SBX_API_KEY}" | jq
+
+# 创建沙箱（默认 code-interpreter 模板）
+SID=$(curl -sS -X POST http://${SBX_SSH_HOST}:8902/sandboxes \
+  -H "Authorization: Bearer ${SBX_API_KEY}" -H "Content-Type: application/json" \
+  -d '{"templateID":"code-interpreter","timeout":600}' | jq -r .sandboxID)
+echo "sandbox=$SID"
+
+# 等 health=true
+for i in {1..30}; do
+  curl -sS http://${SBX_SSH_HOST}:8902/sandboxes/$SID/health \
+    -H "Authorization: Bearer ${SBX_API_KEY}" | jq -e '.ok' >/dev/null && break
+  sleep 2
+done
+
+# 销毁
+curl -sS -X DELETE http://${SBX_SSH_HOST}:8902/sandboxes/$SID \
+  -H "Authorization: Bearer ${SBX_API_KEY}"
+```
+
+**B. Python（E2B 官方 SDK，零代码改动）**
+```python
+from e2b_code_interpreter import Sandbox
+sbx = Sandbox.create(
+    api_url=f"http://{SBX_SSH_HOST}:8902",
+    api_key="${SBX_E2B_KEY}",   # 需 e2b_ 前缀
+    domain="${SBX_DOMAIN}",      # 走 edge-proxy 子域路由
+)
+print(sbx.run_code("import sys; print(sys.version_info)").text)
+sbx.kill()
+```
+
+**C. Claude Code / Cursor（MCP）**
+把 §4.7.2 的 MCP 配置写入 `~/.claude/mcp_servers.json`（或项目 `.mcp.json`），重启 IDE，然后在对话里说 `用 zt-sandbox 跑 print(1+1)`。
+
+---
+
 ## 1. 项目是什么
 
 一句话：**给 AI 智能体用的隔离执行环境**。智能体要跑代码、要操作浏览器、要处理文件——都丢到这个沙箱里，跑完销毁，互不影响。
@@ -51,15 +105,40 @@ sbx.run_code("print(1+1)")
 ## 2. 架构
 
 ```
-  你（或你的 Agent）  ──▶  管控面 (FastAPI @ :8902)
-                               │  docker SDK
-                               ▼
-                          数据面（每个沙箱一个容器）
-                               │
-                               ├── mini_envd :49983  （文件 / 进程 RPC，ConnectRPC JSON）
-                               ├── jupyter   :49999  （代码执行，Jupyter 内核协议）
-                               └── browser   :3000   （Chromium CDP + Session API）
+                          ┌────────────────────────────┐
+   Claude Code/Cursor ───┤  MCP server (stdio, 本地)   │
+   E2B SDK / curl    ─────┤                            │
+                          └──────────┬─────────────────┘
+                                     │
+                ┌────────────────────┼────────────────────┐
+                │ HTTP :8902 (管控)  │                    │
+                ▼                    │                    │
+   ┌────────────────────────┐        │                    │
+   │  sandbox-control-plane │        │                    │
+   │  FastAPI / SQLite     │        │                    │
+   │  生命周期 / 模板 / 配额│        │                    │
+   └──────────┬─────────────┘        │
+              │ docker SDK            │ HTTPS :443 (子域路由)
+              ▼                       ▼
+   ┌─────────────────────────────────────────────────┐
+   │           数据面（每沙箱一个容器, --network=host）│
+   │  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+   │  │ mini_envd│  │ jupyter  │  │ chromium │       │
+   │  │  :49983  │  │  :49999  │  │  :3000   │       │
+   │  └──────────┘  └──────────┘  └──────────┘       │
+   └─────────────────────────────────────────────────┘
+              ▲                       ▲
+              │ HTTP                  │ HTTPS {port}-{sid}.${DOMAIN}
+              └───────────────────────┘  (edge-proxy)
 ```
+
+**三个入口，三条路径**：
+
+| 入口 | 管控面 (`:8902`) | 数据面（容器端口） |
+|---|---|---|
+| **E2B SDK** | `X-API-KEY` 头，HTTPS 调 `:8902` 创建 | SDK 用 `envdAccessToken` 直连 envd :49983 |
+| **REST / curl** | `Authorization: Bearer` 调 `:8902` | HTTPS 走 edge-proxy `:443`（`{port}-{sid}.${DOMAIN}`） |
+| **MCP** | 同 REST，stdin/stdout 协议封装 | 同 REST，走 edge-proxy |
 
 **关键设计决策**：
 
@@ -85,6 +164,87 @@ sbx.run_code("print(1+1)")
 | 并发调度 + 准入控制 | ✅ 已交付 | MAX_SANDBOXES=24, MAX_MEMORY_MB=6144 |
 | TTL 超时回收 | ✅ 已交付 | 调度器每 15s 扫描 |
 | 控制台 UI | ❌ 不支持 | 走 REST / SDK |
+
+---
+
+## 3.1 环境变量
+
+**管控面容器**（`sandbox-control-plane`，写进 `deploy/docker-compose.yml` 或 `.env`）：
+
+| 变量 | 必填 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `API_KEYS` | ✅ | 空 | 逗号分隔的 key 列表，至少填一个（推荐 `e2b_<随机>` 前缀） |
+| `SANDBOX_DOMAIN` | ❌ | `${SBX_SSH_HOST}.nip.io` | edge-proxy 子域路由用的公网域名 |
+| `CRIU_ENABLED` | ❌ | `auto` | `auto` / `force` / `off`，CRIU 失败时是否降级 docker stop |
+| `MAX_SANDBOXES` | ❌ | `24` | 全局最大并发沙箱数（429 配额满错误码） |
+| `MAX_MEMORY_MB` | ❌ | `6144` | 全局内存配额（MB），所有沙箱 memoryMB 之和 |
+| `CHECKPOINT_DIR` | ❌ | `/var/lib/sbx-checkpoints` | CRIU checkpoint 落盘目录 |
+
+**MCP server**（本地 Claude Code / Cursor 进程）：
+
+| 变量 | 必填 | 说明 |
+|---|---|---|
+| `SBX_API_URL` | ✅ | 例：`http://192.168.2.162:8902` |
+| `SBX_API_KEY` | ✅ | 管控面 key，对应 `Authorization: Bearer` |
+| `SBX_DOMAIN` | ✅ | 边缘代理域名，例：`192.168.2.162.nip.io` |
+| `SBX_CA_CERT` | ❌ | 自签 CA 证书绝对路径，推荐必填 |
+| `SBX_INSECURE` | ❌ | `1` 关闭 TLS 校验，仅 dev |
+| `SBX_HTTP_TIMEOUT` | ❌ | 默认 `120`（秒） |
+
+---
+
+## 3.2 管控面 API 速查
+
+> **鉴权**：所有端点（除 `/health`）都需要 `Authorization: Bearer <key>` **或** `X-API-KEY: <key>`。
+> e2b SDK 只发后者，REST/curl 用前者。
+
+| 方法 | 路径 | 用途 |
+|---|---|---|
+| `GET` | `/health` | 健康检查 + 容量 + 能力（`criu` / `netpolicy`） |
+| `GET` | `/v2/templates` | 列出已注册模板（含 `browserEnabled` 等） |
+| `GET` | `/templates/{code}` | 模板详情 |
+| `POST` | `/v3/templates` | 创建/注册模板（支持 `networkPolicy`） |
+| `DELETE` | `/templates/{code}` | 删除模板 |
+| `GET` | `/templates/{code}/builds/{build_id}/status` | 模板构建进度 |
+| `POST` | `/sandboxes` | **创建沙箱**（`templateID` + `timeout`），返回 `sandboxID` + `envdAccessToken` |
+| `GET` | `/v2/sandboxes` | 列出所有沙箱 |
+| `GET` | `/sandboxes/{id}` | 沙箱详情（含 `state` / `pauseMode`） |
+| `GET` | `/sandboxes/{id}/health` | 沙箱就绪探针（`ok` / `services`） |
+| `POST` | `/sandboxes/{id}/connect` | 重新拿 token |
+| `POST` | `/sandboxes/{id}/pause` | 暂停（CRIU，失败降级 stop） |
+| `POST` | `/sandboxes/{id}/resume` | 恢复 |
+| `DELETE` | `/sandboxes/{id}` | 销毁 |
+| `POST` | `/sandboxes/{id}/timeout` | 续期 TTL（秒） |
+| `POST` | `/sandboxes/{id}/refreshes` | 刷新访问 token |
+| `GET` / `POST` / `DELETE` | `/sandboxes/{id}/netpolicy` | 网络白名单 |
+| `POST` | `/sandboxes/{id}/netpolicy/refresh` | 手动重解析 FQDN（CDN 切换） |
+
+数据面（每个沙箱）：
+
+| 端口 | 协议 | 用途 | 入口 |
+| --- | --- | --- | --- |
+| 49983 | ConnectRPC JSON + `/files` | envd 文件/进程 | `https://49983-{sid}.${DOMAIN}` |
+| 49999 | Jupyter | run_code | `https://49999-{sid}.${DOMAIN}` |
+| 3000 | HTTP + WS | Chromium CDP + Session API | `https://3000-{sid}.${DOMAIN}` |
+
+---
+
+## 3.3 错误码
+
+响应体统一格式：`{"code": <int>, "message": <str>, "requestID": <str>}`。
+
+| code | 含义 | HTTP | 触发场景 |
+| --- | --- | --- | --- |
+| 100001 | API Key 无效 | 401 | key 不在 `API_KEYS` / header 缺失 |
+| 100002 | 模版不存在 | 404 | `templateID` 未注册 |
+| 100003 | 沙箱不存在 | 404 | 已销毁 / ID 写错 |
+| 100004 | 参数缺失或非法 | 400 | 缺 `templateID` / `timeout` 等 |
+| 100005 | 沙箱启动失败 | 500 | 镜像拉失败 / 端口冲突 |
+| 100006 | 恢复失败 | 404 / 503 | CRIU 镜像损坏 / container 不存在 |
+| 100007 | 有依赖不能删 | 409 | 还有子引用 |
+| 100009 | 配额满 | 429 | `MAX_SANDBOXES` / `MAX_MEMORY_MB` 超限 |
+
+429 配额满：先 `DELETE` 不用的沙箱，或减小 `memoryMB` 重试。
 
 ---
 
@@ -252,6 +412,8 @@ httpx.post(f"{API}/v3/templates", headers=H, json={
 
 实现原理：管控面（跑在 `network_mode: host`）按容器源 IP 在 `DOCKER-USER` 链挂专属链 `SBX_<id>`，白名单外的流量直接 DROP。
 
+P3 起支持**通配符域名**（`*.example.com`）+ **CDN 切换自动跟随**：详见 §4.10。
+
 ### 4.5 检查系统健康
 
 ```python
@@ -336,6 +498,325 @@ docker cp sbx-{sandboxID}:/home/user/workspace/output.csv ./output.csv
 
 ---
 
+### 4.7 让 Claude Code / Cursor 直接驱动沙箱（**MCP 集成**）
+
+> 🆕 P3 引入。装一次 MCP 配置，Claude Code 就能在对话里直接 `create_sandbox`、`run_code`、`files_read`，**零代码接入**。
+
+#### 4.7.1 安装依赖
+
+在**本地机器**（Claude Code / Cursor 运行的地方），一次性装好 MCP SDK：
+
+```bash
+pip install -r sandbox-service/server/requirements-mcp.txt
+```
+
+#### 4.7.2 配置 MCP host
+
+**Claude Code**（`~/.claude/mcp_servers.json` 或项目级 `.mcp.json`）：
+
+```json
+{
+  "mcpServers": {
+    "zt-sandbox": {
+      "command": "python",
+      "args": ["e:/work/zt-Sandbox/sandbox-service/server/mcp_server.py"],
+      "env": {
+        "SBX_API_URL": "http://${SBX_SSH_HOST}:8902",
+        "SBX_API_KEY": "${SBX_API_KEY}",
+        "SBX_DOMAIN": "${SBX_DOMAIN}",
+        "SBX_CA_CERT": "e:/work/zt-Sandbox/sandbox-service/certs/ca.pem"
+      }
+    }
+  }
+}
+```
+
+> 端口/密钥占位符请替换为实际值（见 §0 速查）。`SBX_CA_CERT` 指向自签 CA；如果懒得管，加 `"SBX_INSECURE": "1"` 走明文校验（仅 dev）。
+
+#### 4.7.3 可用 tools（12 个）
+
+| 分类 | Tool | 说明 |
+|---|---|---|
+| 模板 | `list_templates` | 列出可用模板 |
+| 生命周期 | `create_sandbox` | 创建实例（返回 sandbox_id） |
+| 生命周期 | `list_sandboxes` / `get_sandbox` | 列表 / 详情 |
+| 生命周期 | `kill_sandbox` | 销毁 |
+| 生命周期 | `pause_sandbox` / `resume_sandbox` | 暂停（CRIU 保留内存）/ 恢复 |
+| 计算 | `run_code` | Jupyter 内核执行 Python（stateful） |
+| 计算 | `run_command` | 前台 shell 命令 |
+| 文件 | `files_read` / `files_write` / `files_list` | 读 / 写 / 列目录 |
+
+#### 4.7.4 在 Claude Code 里使用
+
+```text
+> 用 zt-sandbox 创建一个 Python 沙箱，跑 "import numpy as np; print(np.__version__)"
+  → Claude 调用 create_sandbox → run_code → kill_sandbox，整个流程自动完成
+
+> 在那个沙箱里写一个 requirements.txt，pip install requests，然后跑一段请求 https://httpbin.org/ip 的代码
+  → Claude 链式调用 create_sandbox → files_write → run_code（多次）→ kill_sandbox
+
+> 暂停这个沙箱，10 秒后恢复，验证 x = 41 还在
+  → Claude 调用 pause → 等待 → resume → run_code 验证
+```
+
+#### 4.7.5 数据面调用路径
+
+MCP server 不直接连沙箱容器，而是走 **edge-proxy HTTPS 子域路由**（与 e2b SDK 一致）：
+
+```text
+MCP server  ──HTTP──▶  control plane :8902   (lifecycle, 元数据)
+            ──HTTPS─▶  edge-proxy :443
+                          │
+                          ▼  subdomain 路由
+                  https://{port}-{sandboxID}.{DOMAIN}
+                  ├─ 49983 → envd      (files, process)
+                  ├─ 49999 → jupyter   (run_code)
+                  └─ 3000  → browser   (CDP, screenshot)
+```
+
+好处：MCP server 部署在哪都能用，不需要直接连通宿主机 20000+ 端口。
+
+#### 4.7.6 端到端冒烟
+
+```bash
+# 在本机跑，需要 SBX_API_URL / SBX_API_KEY / SBX_DOMAIN 三个环境变量
+python sandbox-service/tests/mcp_smoke.py
+```
+
+会跑完 8 步完整流程：list_templates → create_sandbox → list/get → files 读写 → run_code (stateful) → run_command → pause/resume → kill，验证 Jupyter 变量在 pause/resume 后仍保留。
+
+#### 4.7.7 MCP 排错清单
+
+| 症状 | 检查 |
+| --- | --- |
+| MCP 启动报 `SBX_API_KEY env var is required` | 配置里 `env.SBX_API_KEY` 是否设了，注意**不要**用 `${}` 占位（除非 IDE 支持 shell 变量展开） |
+| MCP 启动报 `SBX_DOMAIN env var is required` | 同上，必须填 `${SBX_DOMAIN}` 实值（不能空） |
+| Tool 调用全 401 | `SBX_API_KEY` 不在 `API_KEYS` 列表里 → 服务器侧加 |
+| Tool 调用全 SSL 错 | 没配 `SBX_CA_CERT` 且未开 `SBX_INSECURE=1` |
+| `run_code` 超时 | 默认 `SBX_HTTP_TIMEOUT=120`；长任务调大或拆段 |
+| 文件读出来是乱码 | 大文件用 `run_command: cat` 或 `docker cp`，`files_read` 走 JSON 字符串 |
+| 创建沙箱 429 | 配额满 → 让 Claude 先调 `list_sandboxes` 把旧的 `kill` 掉 |
+
+---
+
+### 4.8 生命周期钩子 + watchdog（OSEP-0020 风格）
+
+> 🆕 P3 引入。模板可以挂 **startup 钩子**（创建后顺序执行，失败可 fail-closed 整盘回滚）和 **periodic 钩子**（按 `interval_s` 节拍重跑）。
+
+#### 4.8.1 钩子结构
+
+```json
+{
+  "name": "marker",
+  "command": "mkdir -p /tmp/hook && touch /tmp/hook/ok",
+  "cwd": "/var/log",
+  "env": {"FOO": "bar"},
+  "timeout_s": 30,
+  "fail_closed": true,
+  "interval_s": 60          // 仅 periodic 用：两次执行至少间隔这么多秒
+}
+```
+
+| 字段 | 适用 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `name` | 全部 | `"?"` | 用于查日志和 hook_state 索引 |
+| `command` | 全部 | **必填** | 通过 `/bin/sh -c` 在容器内 `docker exec` 执行 |
+| `cwd` / `env` | 全部 | `null` | 可选 |
+| `timeout_s` | 全部 | 60 | watchdog 墙钟超时；超时返回 error 但**不杀进程**（需要硬杀请自己在 command 里加 `timeout`） |
+| `fail_closed` | startup | `true` | 失败时是否阻塞沙箱发布；`false` 时仅记录，仍继续后续钩子 |
+| `interval_s` | periodic | 60 | 两次执行最少间隔多少秒 |
+
+#### 4.8.2 创建带钩子的模板
+
+```bash
+curl -X POST http://${SBX_DOMAIN}:8902/v3/templates \
+  -H "Authorization: Bearer ${SBX_API_KEYS}" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "with-hooks",
+    "image": "sandbox/code-interpreter:v1",
+    "cpuCount": 1, "memoryMB": 1024, "diskSizeMB": 1024,
+    "startupHooks": [
+      {"name": "warm-cache", "command": "mkdir -p /home/user/workspace && ls /home/user/workspace", "timeout_s": 10},
+      {"name": "block-if-broken", "command": "exit 0", "fail_closed": true}
+    ],
+    "periodicHooks": [
+      {"name": "tick", "command": "echo $(date -Iseconds) >> /tmp/tick.log", "interval_s": 30}
+    ]
+  }'
+```
+
+#### 4.8.3 单独改钩子（不重建模板）
+
+```bash
+# 查
+curl -s -H "Authorization: Bearer ${SBX_API_KEYS}" \
+  http://${SBX_DOMAIN}:8902/templates/${TMPL_CODE}/hooks | jq
+
+# 改：startupHooks / periodicHooks 至少传一个，未传的保持不变
+curl -X PUT -H "Authorization: Bearer ${SBX_API_KEYS}" \
+  -H "Content-Type: application/json" \
+  -d '{"periodicHooks": [{"name":"tick","command":"echo OK","interval_s":15}]}' \
+  http://${SBX_DOMAIN}:8902/templates/${TMPL_CODE}/hooks
+```
+
+#### 4.8.4 看执行历史
+
+```bash
+curl -s -H "Authorization: Bearer ${SBX_API_KEYS}" \
+  http://${SBX_DOMAIN}:8902/sandboxes/${SBX_ID}/hooks/status | jq
+```
+
+返回示例：
+```json
+{
+  "sandboxID": "sbx...",
+  "configuredStartupHooks": [{"name": "warm-cache", ...}],
+  "configuredPeriodicHooks": [{"name": "tick", "interval_s": 30}],
+  "hookState": {
+    "startup": {
+      "ran_at": 1730000000.12,
+      "all_passed": true,
+      "blocking_failures": [],
+      "results": [{"name": "warm-cache", "ok": true, "exit_code": 0, "elapsed_s": 0.04, "stdout": "...", "stderr": ""}]
+    },
+    "periodic": {
+      "last_tick": 1730000030.5,
+      "hooks": {
+        "tick": {"last_run": 1730000030.5, "last_ok": true, "last_error": "", "elapsed_s": 0.01}
+      }
+    }
+  }
+}
+```
+
+#### 4.8.5 失败语义
+
+| 场景 | 结果 |
+|---|---|
+| startup hook 超时 | 单条记录 `ok=false, error="timeout after 30s"`，不影响后续（除非 fail_closed） |
+| startup hook 任意一条 `fail_closed=true` 失败 | **整盘回滚**：容器销毁 + 元数据删除 + `POST /sandboxes` 返回 **500 `启动钩子失败: [...]`** |
+| startup hook `fail_closed=false` 失败 | 记录在 `hook_state.startup.results`，`all_passed=true`，沙箱正常发布 |
+| periodic hook 失败 | 仅记日志 + 更新 `last_ok=false` / `last_error`，**不杀沙箱**（best-effort） |
+
+#### 4.8.6 端到端冒烟
+
+```bash
+python sandbox-service/tests/hook_smoke.py
+```
+
+跑 5 项：PUT hooks round-trip → startup 成功 → startup fail-closed 回滚 → startup 非阻塞失败容忍 → periodic 触发验证。
+
+---
+
+### 4.9 Ingress on-demand keepalive
+
+> 🆕 P3 引入。**用户视角**：暂停的沙箱对端来说"永远在线"——任何 HTTPS 请求过来都会自动触发唤醒，**不需要显式调 `/connect`**。
+
+#### 4.9.1 行为对比
+
+| 场景 | 没有 keepalive | 有了 keepalive |
+|---|---|---|
+| 用户在浏览器打开 paused sandbox URL | `ERR_CONNECTION_REFUSED` | 第一次请求 ~1.5s 后页面正常加载（用户无感） |
+| 用户 curl paused sandbox 的 envd | `curl: (7) Failed to connect` | curl 拿到 200 |
+| WebSocket / CDP | 连接失败 | 自动恢复 + 转发 |
+| 后续请求 | 都失败 | 走 fast path（容器已 running） |
+
+实现路径只有 ~10 行：
+
+```text
+client ──HTTPS──▶ edge proxy ──open_connection──▶ sandbox host_port
+                                        │
+                                        └── ECONNREFUSED?
+                                                │
+                                                ▼
+                                  POST /internal/auto-resume
+                                                │
+                                                ▼
+                                  resume sandbox, retry once
+```
+
+#### 4.9.2 端点
+
+```bash
+# 内部端点（不走 API Key 鉴权，因为只有边缘代理会调）
+curl -X POST "http://127.0.0.1:8902/internal/auto-resume?sandbox=$SID&port=$PORT"
+# → 200 {"ok":true}                     # 唤醒成功
+# → 200 {"ok":true,"alreadyRunning":true} # running 沙箱直接 no-op
+# → 404 sandbox not found                # 不存在
+# → 409 cannot auto-resume              # 状态非 paused
+# → 503 resume failed                   # 容器存在但 _resume_data_plane 失败
+```
+
+#### 4.9.3 失败模式
+
+| 触发 | 结果 |
+| --- | --- |
+| paused 沙箱 → /internal/auto-resume | 同步 resume + 等 envd 就绪；返回 200 |
+| running 沙箱 → /internal/auto-resume | no-op，秒回 `{alreadyRunning:true}`（proxy 第一次重试用） |
+| 唤醒后 sandbox 仍无法 listen port | 503，proxy 透传给客户端 |
+| sandbox row 不存在 | 404（这种情况一般不会出现，因为 proxy 先解析 host header） |
+
+#### 4.9.4 端到端冒烟
+
+```bash
+python sandbox-service/tests/keepalive_smoke.py
+```
+
+跑 4 项：running 可达 → paused 唤醒（~1.7s wake vs 0.01s fast path）→ 二次唤醒循环 → `/internal/auto-resume` 幂等。
+
+> **⚠️ 运行前提**：因为 Windows 开发机出站 443 受限，这个 smoke 必须在 **Linux server** 上跑（已通过 `sftp` 上传到 `/srv/sandbox-service/tests/keepalive_smoke.py`）。
+> 或者从任何能解析 `*.${SBX_DOMAIN}` + 连得上 server:443 的机器跑。
+
+### 4.10 Egress FQDN allowlist（通配符 + CDN 切换）
+
+> 🆕 P3 引入。在 P2 IP/CIDR + 单域名白名单的基础上加两件事：**通配符域名** `*.example.com`、**周期性重解析**（CDN 切换 IP 后自动跟随）。
+
+#### 4.10.1 语法
+
+| 写法 | 含义 |
+|---|---|
+| `example.com` | 精确匹配，只解析 apex |
+| `*.example.com` | 通配，展开为 apex + `www/api/cdn/static/assets/chat` 六个常用前缀（都解析） |
+| `10.0.0.0/8` | CIDR 字面量，原样写入 iptables `-d` 规则 |
+
+> **为什么展开固定前缀而不是枚举所有子域？** 没权威方法列出 `*.example.com` 下所有域名。固定前缀覆盖 90% 实际场景，其余子域通常共享 apex 的 CDN 边缘 IP，apex 规则已经够用。
+
+#### 4.10.2 手动 / 自动刷新
+
+```bash
+# 手动：每次会 flush+重建当前 SBX_<id> 链
+curl -X POST "http://127.0.0.1:8902/sandboxes/$SID/netpolicy/refresh"
+# → {"sandboxID":"...","refreshedAt":<unix_ts>,"allowed":[...],"resolved":{...}}
+# → 200 {"skipped":true,...}       # open mode / 已销毁的沙箱
+
+# 自动：管控面后台每 5min 跑一次（覆盖所有 allowlist 模式的活跃沙箱）
+# 调 NETPOLICY_REFRESH_S=<秒> 改周期
+```
+
+CDN 切换场景：原 IP 被回收 / 新 IP 上线 → 下一次 refresh 把新 IP 写进 iptables，沙箱侧无感。
+
+#### 4.10.3 实现细节
+
+- 解析走 `socket.getaddrinfo`；**只保留 IPv4**（iptables-nft 在本部署环境拒绝 IPv6 target，会刷一堆 warning）。
+- chain 名 `SBX_<id-last10>`（iptables 链名 ≤ 28 字符限制）。
+- 状态保存在管控面进程内的 `_state[sandbox_id]`，重启会丢失（重启后第一次 refresh 会按"已无状态"跳过，沙箱侧旧规则仍在；如需重启后立刻对齐，需要重建沙箱或重新 POST `/netpolicy`）。
+- `127.0.0.1` 的 host-network 沙箱**不自动**应用 netpolicy（所有沙箱共享回环，iptables 无意义）；但可以走 `POST /sandboxes/{id}/netpolicy` 手动装——见 fqdn smoke 就是这么验证的。
+
+#### 4.10.4 端到端冒烟
+
+```bash
+python sandbox-service/tests/fqdn_smoke.py
+```
+
+跑 3 项：
+
+1. **wildcard 展开**：`*.openai.com` + `*.anthropic.com` → apex + `www/api/cdn/...` 都在 `resolved` 里
+2. **手动 refresh**：`refreshedAt` 推进、`resolved` 返回新 IP
+3. **精确模式不展开**：`example.com` 不会自动塞进 `www.example.com`
+
+---
+
 ## 5. 镜像矩阵
 
 统一 base `sandbox/base:v1`（Python 3.11 + mini_envd + Chromium 154），三个 flavour 通过 `SBX_FEATURES` 环境变量选择性拉起服务：
@@ -361,6 +842,10 @@ docker cp sbx-{sandboxID}:/home/user/workspace/output.csv ./output.csv
 | **P1+ 浏览器 session** | `tests/p1b_session_smoke.py` | **长会话 + 多 tab + 并发沙箱（11 项）** |
 | P2 全套 | `tests/p2_smoke.py [net|criu|stress]` | 网络白名单 + CRIU 暂停 + 并发压测 |
 | 快速 pause 验证 | `tests/quick_pause_test.py` | create→run→pause→connect→run→kill |
+| **P3 MCP 集成** | `tests/mcp_smoke.py` | **12 个 MCP tools 端到端（stdio 子进程调用）** |
+| **P3 Lifecycle Hook** | `tests/hook_smoke.py` | **startup fail-closed 回滚 + periodic 节拍触发（5 项）** |
+| **P3 Ingress Keepalive** | `tests/keepalive_smoke.py` | **paused 沙箱自动唤醒（4 项：wake vs fast path 时延对比 + 二次唤醒循环 + 幂等）** |
+| **P3 FQDN Allowlist** | `tests/fqdn_smoke.py` | **通配符展开 + CDN 切换 refresh + 精确模式不展开（3 项）** |
 
 运行：
 ```bash
@@ -374,6 +859,9 @@ python tests/p1_browser_smoke.py
 python tests/p1b_session_smoke.py browser 3    # 浏览器 + 3 并发沙箱
 python tests/p2_smoke.py                       # 全套
 python tests/p2_smoke.py criu                  # 只跑 CRIU
+python tests/mcp_smoke.py                      # MCP 集成冒烟
+python tests/hook_smoke.py                     # 钩子 + watchdog
+python tests/fqdn_smoke.py                    # FQDN 通配符 + CDN refresh
 ```
 
 ---
@@ -474,14 +962,45 @@ docker logs sandbox-control-plane --tail 50
 
 ## 11. 给 Agent 的最后提示
 
+### 11.1 工作约定（按优先级）
+
 1. **优先用封装好的 Session API**（§4.3 方式 A），不要自己拼 CDP 调用
 2. **创建沙箱后等 health 轮询**返回 `ok: true` 再开始用（Chromium 启动慢，要 30-60 秒）
 3. **销毁比创建便宜**——不要复用一个脏沙箱，用完就 `kill()`
 4. **pause 不等于 kill**——pause 后沙箱还在（占端口 / 占配额），不用就 `kill()`
-5. **错误格式**：`{"code": 100004, "message": "参数缺失", "requestID": "..."}`
-   - 100001 鉴权 / 100002 模版不存在 / 100003 资源不存在 / 100004 参数错 / 100005 启动失败
-   - 100006 恢复失败 / 100007 有依赖不能删 / 100009 配额满
-6. **state 字段**：`running` / `paused`；`pauseMode` 字段：`criu` / `stop`
-7. **feature 字段**：`"envd,jupyter"` / `"envd,browser"` / `"envd,jupyter,browser"`
+5. **每个任务新开沙箱**——脏数据 + 内存膨胀让复用得不偿失
+6. **批量任务开并发**——`MAX_SANDBOXES=24`，合理并发用满配额
+7. **捕到异常立即 abort**——503/429 多半是配额满，先 `DELETE` 旧的再重试
+
+### 11.2 字段速记
+
+| 字段 | 取值 |
+| --- | --- |
+| 响应错误 `code` | 100001 鉴权 / 100002 模版不存在 / 100003 资源不存在 / 100004 参数错 / 100005 启动失败 / 100006 恢复失败 / 100007 有依赖不能删 / 100009 配额满 |
+| 沙箱 `state` | `running` / `paused` |
+| 沙箱 `pauseMode` | `criu`（保留内存）/ `stop`（只留文件系统） |
+| 模板 `feature` | `"envd,jupyter"` / `"envd,browser"` / `"envd,jupyter,browser"` |
+| 模板 `browserEnabled` | `true` 时 Session API 可用 |
+
+### 11.3 常见任务配方
+
+| 任务 | 推荐路径 |
+| --- | --- |
+| 跑一段 Python 看输出 | `run_code`（MCP）/ `sbx.run_code()`（SDK） |
+| 跑 shell 看 stdout | `run_command` / `sbx.commands.run()` |
+| 上传/下载文件 | `files_read`/`files_write`（小文件）/ `docker cp`（大文件） |
+| 网页截图 | `Session API` + `act:screenshot`（§4.3 方式 A） |
+| 跑浏览器脚本 | `Session API` + `act:evaluate`（不需要 Playwright） |
+| 保留 Jupyter 变量暂停 | `pause_sandbox`(CRIU) → `resume_sandbox` |
+| 限制出网 | 创建模板时 `networkPolicy.mode=allowlist` + `domains` |
+| 排查配额 | `GET /health` 看 `capacity.used` → `DELETE` 旧沙箱 |
+
+### 11.4 拿到 token 之后
+
+- `envdAccessToken` 仅本次沙箱有效，跨沙箱不通用
+- 过期用 `POST /sandboxes/{id}/refreshes` 续期
+- 数据面走 HTTPS edge-proxy，**必须**带 `X-Access-Token: <token>` 头
+
+---
 
 读完这篇还有问题，去翻 `DESIGN.md`（架构细节）或者直接看 `server/main.py`（管控面 API 全在那里）。

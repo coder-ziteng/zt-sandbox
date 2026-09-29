@@ -6,6 +6,7 @@ P2: network allowlist (iptables) + CRIU checkpoint/restore for pause/resume.
 import json
 import logging
 import os
+import threading
 import time
 
 import docker
@@ -22,6 +23,12 @@ CRIU_ENABLED = os.getenv("CRIU_ENABLED", "auto")  # auto | on | off
 NETWORK_NAME = "sandbox-net"
 
 _criu_state = {"checked": False, "ok": False}
+# Guards _criu_probe() and _criu_state writes. Without this, the startup
+# warmup and a concurrent /health hit both see checked=False and race on the
+# shared `sbx-criuprobe` container — the loser's failed probe overwrites the
+# winner's True cache with False, leaving criu_available() reporting False
+# forever despite successful capability.
+_criu_lock = threading.Lock()
 
 
 # ---------------- infra ----------------
@@ -182,6 +189,125 @@ def container_running(sandbox_id: str) -> bool:
         return False
 
 
+# ---------------- lifecycle hooks (P3) ----------------
+
+import threading as _threading
+
+
+def exec_hook(container_name: str, hook: dict) -> dict:
+    """Run a hook inside the container via `docker exec`.
+
+    Watchdog is enforced via wall-clock timeout. On timeout, returns
+    {ok: False, error: 'timeout after Ns}s'} but does NOT kill the in-flight
+    command — the hook author is expected to use `timeout` themselves for
+    hard-kill semantics. (docker SDK doesn't expose a clean cancellation API
+    for exec_run.)
+    """
+    timeout_s = max(1, int(hook.get("timeout_s") or 60))
+    cmd = ["/bin/sh", "-c", hook["command"]]
+    env = hook.get("env") or None
+    cwd = hook.get("cwd") or None
+    box: dict = {"done": False, "out": None, "err": None}
+
+    def _run():
+        try:
+            c = client.containers.get(container_name)
+            res = c.exec_run(cmd, environment=env, workdir=cwd,
+                             demux=True, stream=False, detach=False)
+            box["out"] = res
+        except Exception as e:
+            box["err"] = str(e)
+        finally:
+            box["done"] = True
+
+    t = _threading.Thread(target=_run, daemon=True)
+    t0 = time.time()
+    t.start()
+    t.join(timeout_s)
+    elapsed = time.time() - t0
+    if not box["done"]:
+        log.warning("hook %r in %s timed out after %ss", hook.get("name"), container_name, timeout_s)
+        return {"ok": False, "exit_code": -1, "error": f"timeout after {timeout_s}s",
+                "stdout": "", "stderr": "", "elapsed_s": round(elapsed, 2)}
+    if box["err"]:
+        return {"ok": False, "exit_code": -1, "error": box["err"],
+                "stdout": "", "stderr": "", "elapsed_s": round(elapsed, 2)}
+    res = box["out"]
+    out, err = (b"", b"")
+    if isinstance(res.output, tuple):
+        out, err = res.output
+    elif isinstance(res.output, bytes):
+        out = res.output
+    return {
+        "ok": res.exit_code == 0,
+        "exit_code": res.exit_code,
+        "stdout": (out or b"").decode("utf-8", "replace")[-2000:],
+        "stderr": (err or b"").decode("utf-8", "replace")[-2000:],
+        "elapsed_s": round(elapsed, 2),
+    }
+
+
+def run_startup_hooks(sandbox_id: str, hooks: list) -> dict:
+    """Run a list of startup hooks sequentially.
+
+    Returns a per-hook result list and an aggregate summary:
+      { results: [{name, ok, exit_code, error?, elapsed_s, stdout, stderr}, ...],
+        all_passed: bool,
+        blocking_failures: [names whose fail_closed=true AND exit_code!=0] }
+    Stops at the first fail_closed=True failure so subsequent hooks don't
+    pile on top of a broken sandbox.
+    """
+    name = f"sbx-{sandbox_id}"
+    results = []
+    blocking = []
+    for h in hooks or []:
+        if not isinstance(h, dict) or not h.get("command"):
+            results.append({"name": h.get("name", "?"), "ok": False,
+                            "exit_code": -1, "error": "invalid hook (missing command)"})
+            continue
+        log.info("running startup hook %r in %s", h.get("name"), sandbox_id)
+        r = exec_hook(name, h)
+        r["name"] = h.get("name", "?")
+        results.append(r)
+        if not r["ok"] and h.get("fail_closed", True):
+            blocking.append(r["name"])
+            break
+    return {"results": results, "all_passed": not blocking, "blocking_failures": blocking}
+
+
+def run_periodic_hooks(sandbox_id: str, hooks: list, state: dict, now: float) -> dict:
+    """Run periodic hooks that are due, return the updated state.
+
+    `state` is a per-sandbox dict keyed by hook name with:
+        { last_run: float, last_ok: bool, last_error: str, elapsed_s: float }
+    A hook is "due" when its `interval_s` (default 60) has elapsed since last_run.
+    Failures never abort the schedule — periodic hooks are best-effort.
+    Returns: { ran: [names], state: new_state }
+    """
+    name = f"sbx-{sandbox_id}"
+    ran = []
+    state = dict(state or {})
+    for h in hooks or []:
+        if not isinstance(h, dict) or not h.get("command"):
+            continue
+        hname = h.get("name", "?")
+        interval = max(1, int(h.get("interval_s") or 60))
+        prev = state.get(hname, {}) or {}
+        last_run = float(prev.get("last_run") or 0)
+        if now - last_run < interval:
+            continue
+        log.info("running periodic hook %r in %s", hname, sandbox_id)
+        r = exec_hook(name, h)
+        state[hname] = {
+            "last_run": now,
+            "last_ok": r["ok"],
+            "last_error": r.get("error") or "",
+            "elapsed_s": r.get("elapsed_s", 0.0),
+        }
+        ran.append(hname)
+    return {"ran": ran, "state": state}
+
+
 def start_container(sandbox_id: str, template: dict = None) -> bool:
     try:
         c = client.containers.get(f"sbx-{sandbox_id}")
@@ -272,17 +398,28 @@ def _restore_probe(container_name: str, checkpoint_id: str) -> bool:
 
 
 def criu_available(force=False) -> bool:
-    if _criu_state["checked"] and not force:
+    if force:
+        # Force re-probe under lock; bypass cache.
+        with _criu_lock:
+            ok = _criu_probe()
+            _criu_state.update(checked=True, ok=bool(ok))
+            return _criu_state["ok"]
+    if _criu_state["checked"]:
         return _criu_state["ok"]
     if CRIU_ENABLED == "off":
         _criu_state.update(checked=True, ok=False)
         return False
-    if CRIU_ENABLED == "on" and not force:
+    if CRIU_ENABLED == "on":
         _criu_state.update(checked=True, ok=True)
         return True
-    ok = _criu_probe()  # auto: verify with a real round-trip
-    _criu_state.update(checked=True, ok=bool(ok))
-    return _criu_state["ok"]
+    with _criu_lock:
+        # Double-check after acquiring the lock — another thread may have
+        # already probed and cached a result while we were waiting.
+        if _criu_state["checked"]:
+            return _criu_state["ok"]
+        ok = _criu_probe()  # auto: verify with a real round-trip
+        _criu_state.update(checked=True, ok=bool(ok))
+        return _criu_state["ok"]
 
 
 def _checkpoint_delete(container_name: str, checkpoint_id: str):

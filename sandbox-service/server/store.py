@@ -43,6 +43,10 @@ def _migrate(c):
         c.execute("ALTER TABLE templates ADD COLUMN browser_enabled INTEGER NOT NULL DEFAULT 0")
     if "network_policy" not in tcols:
         c.execute("ALTER TABLE templates ADD COLUMN network_policy TEXT NOT NULL DEFAULT '{}'")
+    if "startup_hooks" not in tcols:
+        c.execute("ALTER TABLE templates ADD COLUMN startup_hooks TEXT NOT NULL DEFAULT '[]'")
+    if "periodic_hooks" not in tcols:
+        c.execute("ALTER TABLE templates ADD COLUMN periodic_hooks TEXT NOT NULL DEFAULT '[]'")
     scols = _table_cols(c, "sandboxes")
     if "host_port_browser" not in scols:
         c.execute("ALTER TABLE sandboxes ADD COLUMN host_port_browser INTEGER")
@@ -52,6 +56,8 @@ def _migrate(c):
         c.execute("ALTER TABLE sandboxes ADD COLUMN features TEXT NOT NULL DEFAULT 'envd,jupyter'")
     if "last_activity" not in scols:
         c.execute("ALTER TABLE sandboxes ADD COLUMN last_activity REAL NOT NULL DEFAULT 0")
+    if "hook_state" not in scols:
+        c.execute("ALTER TABLE sandboxes ADD COLUMN hook_state TEXT NOT NULL DEFAULT '{}'")
 
 
 def init_db():
@@ -106,7 +112,8 @@ def new_id(prefix: str) -> str:
 # ---------- templates ----------
 
 def create_template(name: str, image: str, cpu: int, mem: int, disk: int, envs: dict,
-                    browser_enabled: bool = False, network_policy: dict = None) -> str:
+                    browser_enabled: bool = False, network_policy: dict = None,
+                    startup_hooks: list = None, periodic_hooks: list = None) -> str:
     code = new_id("tmpl")
     if not browser_enabled:
         lowered = (image or "").lower()
@@ -114,9 +121,10 @@ def create_template(name: str, image: str, cpu: int, mem: int, disk: int, envs: 
     with db() as c:
         c.execute(
             "INSERT INTO templates (code,name,image,cpu_count,memory_mb,disk_size_mb,env_vars,version,created_at,"
-            "browser_enabled,network_policy) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "browser_enabled,network_policy,startup_hooks,periodic_hooks) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (code, name, image, cpu, mem, disk, json.dumps(envs), 1, time.time(),
-             1 if browser_enabled else 0, json.dumps(network_policy or {"mode": "open"})),
+             1 if browser_enabled else 0, json.dumps(network_policy or {"mode": "open"}),
+             json.dumps(startup_hooks or []), json.dumps(periodic_hooks or [])),
         )
         build_id = new_id("bld")
         c.execute(
@@ -132,6 +140,21 @@ def get_template(code: str):
     with db() as c:
         row = c.execute("SELECT * FROM templates WHERE code=?", (code,)).fetchone()
     return dict(row) if row else None
+
+
+def update_template_hooks(code: str, startup_hooks: list = None, periodic_hooks: list = None) -> bool:
+    """Replace hook lists on a template. Either arg may be None to leave unchanged."""
+    sets, vals = [], []
+    if startup_hooks is not None:
+        sets.append("startup_hooks=?"); vals.append(json.dumps(startup_hooks))
+    if periodic_hooks is not None:
+        sets.append("periodic_hooks=?"); vals.append(json.dumps(periodic_hooks))
+    if not sets:
+        return False
+    vals.append(code)
+    with db() as c:
+        c.execute(f"UPDATE templates SET {','.join(sets)} WHERE code=?", vals)
+    return True
 
 
 def list_templates():

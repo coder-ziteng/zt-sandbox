@@ -4,6 +4,10 @@ Reads port mappings from the shared SQLite DB (WAL, read-only usage).
 
 P1: supports port 3000 (browser) and transparent WebSocket tunnelling, which is
 required for Playwright/Puppeteer CDP (wss://3000-<sandboxID>.<domain>/devtools/...).
+
+P3 ingress keepalive: when upstream connection is refused (sandbox paused), call
+the control plane's /internal/auto-resume to wake it up, then retry. Users see
+their paused sandbox "still listening" without an explicit /connect call.
 """
 import asyncio
 import logging
@@ -11,12 +15,16 @@ import os
 import sqlite3
 import ssl
 
+import httpx
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("edge-proxy")
 
 DB_PATH = "/data/sandbox.db"
 CERT_DIR = os.getenv("CERT_DIR", "/certs")
 UPSTREAM_HOST = "127.0.0.1"
+# control plane URL — same-host fast path so we don't depend on SANDBOX_DOMAIN
+CONTROL_PLANE_URL = os.getenv("CONTROL_PLANE_URL", "http://127.0.0.1:8902")
 
 
 def resolve_route(sandbox_id: str, container_port: int):
@@ -65,6 +73,50 @@ async def pipe(src, dst):
             await dst.drain()
     except Exception:
         pass
+
+
+async def wake_paused_sandbox(sandbox_id: str, host_port: int) -> bool:
+    """Synchronously call the control plane to resume a paused sandbox.
+
+    Returns True if the sandbox is now running (either it already was, or we
+    successfully restored it). False if the wake-up call failed — caller should
+    surface that as a 503 to the client.
+    """
+    url = f"{CONTROL_PLANE_URL}/internal/auto-resume"
+    try:
+        # /internal/* bypasses auth, so no API key needed here.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as cli:
+            r = await cli.post(url, params={"sandbox": sandbox_id, "port": host_port})
+        if 200 <= r.status_code < 300:
+            log.info("ingress keepalive: woke %s (status=%d)", sandbox_id, r.status_code)
+            return True
+        log.warning("ingress keepalive: %s returned %d: %s",
+                    sandbox_id, r.status_code, r.text[:200])
+        return False
+    except Exception as e:
+        log.warning("ingress keepalive: %s call failed: %s", sandbox_id, e)
+        return False
+
+
+async def open_upstream_with_wakeup(host_port: int, sandbox_id: str):
+    """Try to open a connection to the sandbox; if it's paused (ECONNREFUSED),
+    trigger control-plane auto-resume once, then retry once.
+
+    Raises the original connection error if even the retry fails.
+    """
+    try:
+        return await asyncio.open_connection(UPSTREAM_HOST, host_port)
+    except (ConnectionRefusedError, OSError) as e:
+        log.info("upstream %s:%s refused (%s); attempting ingress keepalive wake",
+                 UPSTREAM_HOST, host_port, e)
+        if await wake_paused_sandbox(sandbox_id, host_port):
+            # Give the data plane a brief moment to bind the port after resume.
+            for _ in range(20):
+                try:
+                    return await asyncio.open_connection(UPSTREAM_HOST, host_port)
+                except (ConnectionRefusedError, OSError):
+                    await asyncio.sleep(0.25)
+        raise
 
 
 async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
@@ -121,8 +173,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
 
         log.info("route %s -> 127.0.0.1:%s (%s%s)", host_header, host_port, request_line,
                  " [websocket]" if upgrade else "")
-        upstream = await asyncio.open_connection(UPSTREAM_HOST, host_port)
-        ur, uw = upstream
+        ur, uw = await open_upstream_with_wakeup(host_port, sandbox_id)
 
         new_headers = []
         for h in headers_raw:
