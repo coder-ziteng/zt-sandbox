@@ -174,6 +174,7 @@ sbx.run_code("print(1+1)")
 | 变量 | 必填 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `API_KEYS` | ✅ | 空 | 逗号分隔的 key 列表，至少填一个（推荐 `e2b_<随机>` 前缀） |
+| `API_KEYS_JSON` | ❌ | 空 | **P4**：多租户身份绑定，详见 §4.13。JSON 数组 `[{key,owner,tenant}]`；留空则所有 key 视为 `(default,default)`，归属校验被关闭 |
 | `SANDBOX_DOMAIN` | ❌ | `${SBX_SSH_HOST}.nip.io` | edge-proxy 子域路由用的公网域名 |
 | `CRIU_ENABLED` | ❌ | `auto` | `auto` / `force` / `off`，CRIU 失败时是否降级 docker stop |
 | `MAX_SANDBOXES` | ❌ | `24` | 全局最大并发沙箱数（429 配额满错误码） |
@@ -968,6 +969,73 @@ python sandbox-service/tests/metrics_smoke.py
 
 ---
 
+### 4.13 多租户归属 + 容器内路径沙箱（P4 第四刀）
+
+> 🆕 P4 引入。在原来的"任意 API Key 操作任意 sandbox"基础上加两层隔离：管控面校验身份（不匹配 403）+ 数据面限制文件路径在 `/workspace` / `/tmp` 内（越界 403）。
+
+#### 4.13.1 身份配置
+
+`API_KEYS_JSON` 用分号分隔多条 `key:owner:tenant`，避开 docker-compose env-file 的引号剥离问题：
+
+```bash
+# .env (或 deploy/.env)
+API_KEYS_JSON=e2b_alice_xxx:alice:acme;e2b_bob_xxx:bob:acme;e2b_eve_xxx:eve:evil
+```
+
+> 早期版本用 JSON 数组格式，但 docker-compose 解析 env-file 时会把所有引号剥掉，导致 `json.loads()` 报错。改成分号+冒号格式后就稳定了。
+
+- `API_KEYS_JSON` 留空 → 全部 key 走 `(default,default)`，归属校验被关闭（向后兼容单 key 场景）。
+- 一旦任何一条 `(owner, tenant)` 不全是 `default`，`ISOLATION_ENABLED` 翻为 `True`，所有 sandbox 端点强制归属校验。
+- 创建沙箱时 `owner` / `tenant` 直接从调用方身份落库，不再接受请求体里的 metadata。
+
+#### 4.13.2 管控面：归属校验
+
+| 调用 | 结果 |
+| --- | --- |
+| Alice GET/操作自己创建的 sandbox | 200 |
+| Bob（同 tenant 不同 owner）GET Alice 的 sandbox | 403 `无权访问此沙箱` |
+| Eve（不同 tenant）GET Alice 的 sandbox | 403 |
+| Alice `GET /v2/sandboxes` | 仅返回 owner=alice & tenant=acme 的沙箱 |
+| Bob `GET /v2/sandboxes` | 仅返回 owner=bob & tenant=acme 的沙箱 |
+| Eve `GET /v2/sandboxes` | 返回空（她没创建沙箱） |
+| 任意人持错误 key | 401 `API Key 无效`（在归属校验之前先拦掉） |
+
+实现要点：
+
+- `auth` 中间件把 `(owner, tenant)` 挂到 `request.state`，所有 `GET/POST/DELETE /sandboxes/{id}*` 端点在拿到 row 之后立即调 `check_owner(request, row)`。
+- 内部端点 `/internal/auto-resume` 也走同一检查，防止 edge-proxy 在 keepalive 触发时把别人的沙箱自动唤醒。
+- 数据库迁移自动给旧行加 `owner='default'` / `tenant='default'`，不影响存量沙箱。
+
+#### 4.13.3 数据面：路径沙箱
+
+`mini_envd` 里 `resolve()` 强制：
+
+- 相对路径 → 锚定到 `/workspace`（旧逻辑锚定到 `/home/user`，P4 改这里）。
+- 绝对路径 → `.resolve()` 后必须以 `/workspace/` 或 `/tmp/` 开头，否则 `PermissionError` → 403。
+- 阻断 `/etc/` `/root/` `/proc/` `/sys/` `/home/` 等系统路径。
+- 阻断路径穿越：写入 `foo/../../etc/evil` → resolve 到 `/etc/evil` → 403。
+
+`process.Process/Start` 的 `cwd` 字段也走同一闸门，逃不出 `/workspace`。
+
+容器启动时（`envdsvc/start.sh`）：
+
+```sh
+mkdir -p /home/user/workspace /workspace
+chown -R user:user /workspace 2>/dev/null || true
+```
+
+> **设计取舍**：不重建 base 镜像，而是在 `start.sh` 里 mkdir `/workspace` + chown 给运行用户。这样 P0~P3 已部署的容器下一次重启就生效。
+
+#### 4.13.4 端到端冒烟
+
+```bash
+# 启动管控面时设 API_KEYS_JSON (见 .env.example)
+python sandbox-service/tests/ownership_smoke.py     # 8 项: 跨 owner/tenant 全部 403
+python sandbox-service/tests/path_sandbox_smoke.py  # 14 项: /etc /root /proc / 越界 / 相对路径 / /tmp
+```
+
+---
+
 ## 5. 镜像矩阵
 
 统一 base `sandbox/base:v1`（Python 3.11 + mini_envd + Chromium 154），三个 flavour 通过 `SBX_FEATURES` 环境变量选择性拉起服务：
@@ -999,6 +1067,8 @@ python sandbox-service/tests/metrics_smoke.py
 | **P3 FQDN Allowlist** | `tests/fqdn_smoke.py` | **通配符展开 + CDN 切换 refresh + 精确模式不展开（3 项）** |
 | **P3 Diagnostic API** | `tests/diag_smoke.py` | **5 section 独立采集 + subset + 404 + 计数器单调性（10 项）** |
 | **P3 Prometheus Metrics** | `tests/metrics_smoke.py` | **/metrics 端点 + 指标族 + 归一化 + 生命周期计数器（7 项）** |
+| **P4 Sandbox 归属** | `tests/ownership_smoke.py` | **跨 owner / tenant 访问 403 + list 过滤 + bad key 401 + 单 key 兼容（8 项）** |
+| **P4 路径沙箱** | `tests/path_sandbox_smoke.py` | **/workspace 允许 + /etc /root /proc / 越界 全部 403 + /tmp 允许 + ConnectRPC 路径校验（14 项）** |
 
 运行：
 ```bash
@@ -1017,6 +1087,8 @@ python tests/hook_smoke.py                     # 钩子 + watchdog
 python tests/fqdn_smoke.py                    # FQDN 通配符 + CDN refresh
 python tests/diag_smoke.py                    # 沙箱诊断快照
 python tests/metrics_smoke.py                # Prometheus 指标冒烟
+python tests/ownership_smoke.py             # 多租户归属 (需要 API_KEYS_JSON 三 key)
+python tests/path_sandbox_smoke.py          # 容器内 /workspace 路径沙箱
 ```
 
 ---

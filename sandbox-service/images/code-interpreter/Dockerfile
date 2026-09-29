@@ -13,7 +13,8 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY envdsvc/mini_envd.py envdsvc/jupyter_svc.py envdsvc/browser_svc.py envdsvc/start.sh /app/
 COPY envdsvc/proto /app/proto
-RUN chmod +x /app/start.sh && mkdir -p /home/user/workspace && chown -R user:user /home/user /app
+RUN chmod +x /app/start.sh && mkdir -p /home/user/workspace /workspace \
+    && chown -R user:user /home/user /workspace /app
 
 ENV SBX_FEATURES=envd,jupyter
 

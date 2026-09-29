@@ -10,6 +10,7 @@ Server-stream requests use envelopes (1 flag byte + 4-byte BE length).
 """
 import asyncio
 import json
+import logging
 import os
 import shutil
 import signal as signal_mod
@@ -23,8 +24,14 @@ from google.protobuf import json_format
 
 from proto import process_pb2, filesystem_pb2
 
-HOME = Path("/home/user")
+log = logging.getLogger("mini_envd")
+
+HOME = Path("/workspace")
 ENVD_TOKEN = os.getenv("ENVD_TOKEN", "")
+
+# P4 路径沙箱: 文件操作只允许在 /workspace 和 /tmp 之内进行。
+# 绝对路径必须落在 ALLOWED_ROOTS 之内 (resolve 后比对),其余一律 403。
+ALLOWED_ROOTS: tuple[Path, ...] = (Path("/workspace"), Path("/tmp"))
 
 app = FastAPI(docs_url=None, redoc_url=None)
 
@@ -41,10 +48,36 @@ def deny() -> JSONResponse:
     return JSONResponse({"message": "unauthorized"}, status_code=401)
 
 
+def deny_path(reason: str) -> JSONResponse:
+    return JSONResponse({"message": f"path outside sandbox: {reason}"}, status_code=403)
+
+
+def _is_within(p: Path) -> bool:
+    """True if p (already resolved) lies inside any ALLOWED_ROOTS prefix."""
+    s = str(p)
+    for root in ALLOWED_ROOTS:
+        rs = str(root)
+        if s == rs or s.startswith(rs + "/"):
+            return True
+    return False
+
+
 def resolve(path: str) -> Path:
+    """Resolve a user-supplied path to an absolute Path, enforcing the sandbox.
+
+    - relative paths → anchored at /workspace
+    - absolute paths must lie under /workspace or /tmp (after symlink resolution)
+    - any other path → raises PermissionError (caller maps to 403)
+    """
     p = Path(path)
     if not p.is_absolute():
         p = HOME / p
+    try:
+        p = p.resolve()
+    except (OSError, RuntimeError):
+        raise PermissionError(f"cannot resolve: {path}")
+    if not _is_within(p):
+        raise PermissionError(f"{path} (resolved to {p})")
     return p
 
 
@@ -129,7 +162,10 @@ def health():
 def read_file(request: Request, path: str):
     if not check_token(request):
         return deny()
-    fp = resolve(path)
+    try:
+        fp = resolve(path)
+    except PermissionError as e:
+        return deny_path(str(e))
     if not fp.exists():
         return JSONResponse({"message": f"no such file or directory: {path}"}, status_code=404)
     if fp.is_dir():
@@ -176,7 +212,10 @@ async def write_files(request: Request, path: str | None = None, username: str |
             file_path = value.filename or path
             if not file_path:
                 return JSONResponse({"message": "path required"}, status_code=400)
-            fp = resolve(file_path)
+            try:
+                fp = resolve(file_path)
+            except PermissionError as e:
+                return deny_path(str(e))
             fp.parent.mkdir(parents=True, exist_ok=True)
             data = await value.read()
             fp.write_bytes(data)
@@ -190,9 +229,17 @@ async def write_files(request: Request, path: str | None = None, username: str |
         if request.headers.get("content-encoding", "").lower() == "gzip":
             import gzip
             body = gzip.decompress(body)
-        fp = resolve(path)
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_bytes(body)
+        try:
+            fp = resolve(path)
+        except PermissionError as e:
+            return deny_path(str(e))
+        try:
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_bytes(body)
+        except PermissionError as e:
+            return deny_path(f"cannot write: {e}")
+        except OSError as e:
+            return JSONResponse({"message": f"write failed: {e}"}, status_code=500)
         if metadata:
             _save_metadata(fp, metadata)
         results.append(_entry_dict(fp, metadata or None))
@@ -219,7 +266,16 @@ async def process_start(request: Request):
     cfg = req.process
     env = dict(os.environ)
     env.update(dict(cfg.envs))
-    cwd = str(resolve(cfg.cwd)) if cfg.cwd else str(HOME)
+    if cfg.cwd:
+        try:
+            cwd = str(resolve(cfg.cwd))
+        except PermissionError:
+            return StreamingResponse(
+                [end_envelope({"code": "forbidden", "message": f"cwd outside sandbox: {cfg.cwd}"})],
+                media_type=ctype,
+            )
+    else:
+        cwd = str(HOME)
     Path(cwd).mkdir(parents=True, exist_ok=True)
 
     timeout_ms = None
@@ -435,9 +491,12 @@ async def _fs_handler(request: Request, req_cls, resp_cls, handler):
     codec, req = await read_rpc_request(request, req_cls)
     try:
         return handler(req, resp_cls, codec)
+    except PermissionError as e:
+        return connect_error("forbidden", f"path outside sandbox: {e}", 403)
     except FileNotFoundError:
         return connect_error("not_found", "no such file or directory", 404)
     except Exception as e:
+        log.exception("fs handler error")
         return connect_error("internal", str(e), 500)
 
 
@@ -497,10 +556,11 @@ async def fs_list_dir(request: Request):
         fp = resolve(req.path)
         if not fp.is_dir():
             return connect_error("not_found", f"not a directory: {req.path}", 404)
+        # E2B semantic: depth=1 → list immediate children of fp; depth=N → recurse N levels.
         depth = req.depth or 1
-        entries = [fp]
+        entries = []
         current = [fp]
-        for _ in range(depth - 1):
+        for _ in range(depth):
             nxt = []
             for d in current:
                 if d.is_dir():

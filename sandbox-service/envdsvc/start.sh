@@ -4,6 +4,7 @@
 # Port assignment is configurable via env vars (needed when running with --network=host
 # so each container can bind to its own unique host port; defaults match the
 # container-port convention for bridge-mode).
+# P4 路径沙箱: /workspace 由 base 镜像预先 chown 给 user,这里只是兜底。
 mkdir -p /home/user/workspace
 cd /app
 

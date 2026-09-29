@@ -58,6 +58,10 @@ def _migrate(c):
         c.execute("ALTER TABLE sandboxes ADD COLUMN last_activity REAL NOT NULL DEFAULT 0")
     if "hook_state" not in scols:
         c.execute("ALTER TABLE sandboxes ADD COLUMN hook_state TEXT NOT NULL DEFAULT '{}'")
+    if "owner" not in scols:
+        c.execute("ALTER TABLE sandboxes ADD COLUMN owner TEXT NOT NULL DEFAULT 'default'")
+    if "tenant" not in scols:
+        c.execute("ALTER TABLE sandboxes ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'")
 
 
 def init_db():
@@ -226,17 +230,17 @@ def get_host_ports(sandbox_id: str):
 # ---------- sandboxes ----------
 
 def create_sandbox(sandbox_id, template_code, client_id, envd_token, ports, metadata, container_name, ttl,
-                   features="envd,jupyter"):
+                   features="envd,jupyter", owner="default", tenant="default"):
     now = time.time()
     browser_port = ports[2] if len(ports) > 2 else None
     with db() as c:
         c.execute(
             "INSERT INTO sandboxes (sandbox_id,template_code,client_id,envd_token,host_port_envd,host_port_jupyter,"
-            "host_port_browser,metadata,state,started_at,end_at,container_name,features,last_activity)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "host_port_browser,metadata,state,started_at,end_at,container_name,features,last_activity,owner,tenant)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 sandbox_id, template_code, client_id, envd_token, ports[0], ports[1], browser_port,
-                json.dumps(metadata), "running", now, now + ttl, container_name, features, now,
+                json.dumps(metadata), "running", now, now + ttl, container_name, features, now, owner, tenant,
             ),
         )
 
@@ -247,11 +251,20 @@ def get_sandbox(sandbox_id: str):
     return dict(row) if row else None
 
 
-def list_sandboxes(states=("running", "paused")):
+def list_sandboxes(states=("running", "paused"), owner=None, tenant=None):
     q = ",".join("?" for _ in states)
+    clauses = [f"state IN ({q})"]
+    params: list = list(states)
+    if owner is not None:
+        clauses.append("owner=?")
+        params.append(owner)
+    if tenant is not None:
+        clauses.append("tenant=?")
+        params.append(tenant)
+    where = " AND ".join(clauses)
     with db() as c:
         rows = c.execute(
-            f"SELECT * FROM sandboxes WHERE state IN ({q}) ORDER BY started_at DESC", states
+            f"SELECT * FROM sandboxes WHERE {where} ORDER BY started_at DESC", params
         ).fetchall()
     return [dict(r) for r in rows]
 

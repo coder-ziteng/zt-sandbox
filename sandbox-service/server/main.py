@@ -29,6 +29,35 @@ MAX_MEMORY_MB = int(os.getenv("MAX_MEMORY_MB", "6144"))
 HOOK_TICK_S = int(os.getenv("HOOK_TICK_S", "30"))
 NETPOLICY_REFRESH_S = int(os.getenv("NETPOLICY_REFRESH_S", "300"))  # 5min
 
+# Optional identity binding: API_KEYS_JSON='key1:owner1:tenant1;key2:owner2:tenant2'
+# Format: semicolon-separated entries of `<key>:<owner>:<tenant>`. The colon
+# format avoids the quote-stripping pitfalls of writing JSON through docker
+# compose's env-file parser. When unset, every key gets (default, default) —
+# single-key legacy mode where sandbox ownership is not enforced.
+OWNER_MAP: dict[str, tuple[str, str]] = {}
+_key_json = os.getenv("API_KEYS_JSON", "").strip()
+if _key_json:
+    try:
+        for entry in _key_json.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(":")
+            if len(parts) < 3:
+                raise ValueError(f"malformed entry: {entry!r}")
+            k, owner, tenant = parts[0], parts[1], parts[2]
+            OWNER_MAP[k] = (owner, tenant)
+            if k not in API_KEYS:
+                API_KEYS.append(k)
+        # Keys in API_KEYS but absent from JSON still get (default, default)
+        # for backward compatibility with legacy single-key deployments.
+        for k in API_KEYS:
+            OWNER_MAP.setdefault(k, ("default", "default"))
+    except Exception as e:
+        log.exception("API_KEYS_JSON 解析失败,回退到 API_KEYS: %s", e)
+
+ISOLATION_ENABLED = any(o != "default" or t != "default" for o, t in OWNER_MAP.values())
+
 app = FastAPI(title="sandbox-service", docs_url=None, redoc_url=None)
 store.init_db()
 runtime.ensure_network()
@@ -53,7 +82,33 @@ async def auth(request: Request, call_next):
         token = request.headers.get("x-api-key", "")
     if token not in API_KEYS:
         return err(100001, "API Key 无效", 401)
+    # Attach caller identity so downstream handlers can enforce ownership.
+    request.state.owner, request.state.tenant = OWNER_MAP.get(token, ("default", "default"))
     return await call_next(request)
+
+
+def caller_identity(request: Request) -> tuple[str, str]:
+    return getattr(request.state, "owner", "default"), getattr(request.state, "tenant", "default")
+
+
+def check_owner(request: Request, row: dict):
+    """Enforce sandbox-ownership in multi-tenant mode.
+
+    Returns None on pass, or a 403 JSONResponse when the caller's identity
+    (from API_KEYS_JSON) does not match the row's stored (owner, tenant).
+    In legacy single-key mode (ISOLATION_ENABLED=False), everyone maps to
+    (default, default) and the check is a no-op.
+    """
+    if not ISOLATION_ENABLED:
+        return None
+    row_owner = (row.get("owner") if row else None) or "default"
+    row_tenant = (row.get("tenant") if row else None) or "default"
+    req_owner, req_tenant = caller_identity(request)
+    if row_owner != req_owner or row_tenant != req_tenant:
+        return err(100011,
+                   f"无权访问此沙箱 (caller={req_owner}/{req_tenant}, sandbox={row_owner}/{row_tenant})",
+                   403)
+    return None
 
 
 @app.middleware("http")
@@ -192,7 +247,9 @@ async def create_sandbox(request: Request):
                        500)
 
     store.create_sandbox(sandbox_id, template_id, client_id, envd_token, list(ports), metadata,
-                         f"sbx-{sandbox_id}", timeout, features=features)
+                         f"sbx-{sandbox_id}", timeout, features=features,
+                         owner=caller_identity(request)[0],
+                         tenant=caller_identity(request)[1])
     if hook_state:
         store.update_sandbox(sandbox_id, hook_state=json.dumps(hook_state))
     row = store.get_sandbox(sandbox_id)
@@ -206,25 +263,34 @@ async def create_sandbox(request: Request):
 def list_sandboxes(request: Request):
     state_param = request.query_params.get("state")
     states = [s for s in state_param.split(",")] if state_param else ("running", "paused")
-    rows = store.list_sandboxes(tuple(states))
+    owner, tenant = caller_identity(request)
+    rows = store.list_sandboxes(tuple(states),
+                                owner=owner if ISOLATION_ENABLED else None,
+                                tenant=tenant if ISOLATION_ENABLED else None)
     return [sandbox_json(r, with_token=False) for r in rows]
 
 
 @app.get("/sandboxes/{sandbox_id}")
-def get_sandbox(sandbox_id: str):
+def get_sandbox(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     # E2B 语义：GET 单个沙箱需带 envdAccessToken，SDK connect 依赖它
     return sandbox_json(row, with_token=True)
 
 
 @app.get("/sandboxes/{sandbox_id}/health")
-def sandbox_health(sandbox_id: str):
+def sandbox_health(sandbox_id: str, request: Request):
     """P1: health polling for the data-plane services inside one sandbox."""
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     import httpx
 
     def probe(port):
@@ -286,6 +352,9 @@ async def connect_sandbox(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     tpl = store.get_template(row["template_code"])
     if row["state"] != "running":
         ok, msg = _resume_data_plane(row, tpl)
@@ -308,6 +377,9 @@ async def pause_sandbox(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     if row["state"] == "paused":
         return Response(status_code=409)
     try:
@@ -335,6 +407,9 @@ async def resume_sandbox(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     body = {}
     try:
         body = await request.json()
@@ -354,10 +429,13 @@ async def resume_sandbox(sandbox_id: str, request: Request):
 
 
 @app.delete("/sandboxes/{sandbox_id}")
-def kill_sandbox(sandbox_id: str):
+def kill_sandbox(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return Response(status_code=404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     prev_state = row.get("state", "running")
     runtime.remove_container(sandbox_id)
     store.delete_sandbox(sandbox_id)
@@ -373,6 +451,9 @@ async def set_timeout(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     # E2B 语义：paused 状态下 set_timeout 必须报错，SDK 才会回退去调 /resume
     if row["state"] != "running":
         return Response(status_code=409)
@@ -386,6 +467,9 @@ async def refresh_sandbox(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     body = {}
     try:
         body = await request.json()
@@ -399,10 +483,13 @@ async def refresh_sandbox(sandbox_id: str, request: Request):
 # ---------------- net policy (P2) ----------------
 
 @app.get("/sandboxes/{sandbox_id}/netpolicy")
-def get_netpolicy(sandbox_id: str):
+def get_netpolicy(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     return netpolicy.status(sandbox_id)
 
 
@@ -411,6 +498,9 @@ async def set_netpolicy(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     body = await request.json()
     ip = runtime.container_ip(sandbox_id)
     r = netpolicy.apply(sandbox_id, ip, body)
@@ -420,11 +510,14 @@ async def set_netpolicy(sandbox_id: str, request: Request):
 
 
 @app.post("/sandboxes/{sandbox_id}/netpolicy/refresh")
-def refresh_netpolicy(sandbox_id: str):
+def refresh_netpolicy(sandbox_id: str, request: Request):
     """P3: manually trigger FQDN re-resolution (e.g. for CDN rotation)."""
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     r = netpolicy.refresh(sandbox_id)
     if r is None:
         return {"sandboxID": sandbox_id, "skipped": True,
@@ -434,7 +527,13 @@ def refresh_netpolicy(sandbox_id: str):
 
 
 @app.delete("/sandboxes/{sandbox_id}/netpolicy")
-def del_netpolicy(sandbox_id: str):
+def del_netpolicy(sandbox_id: str, request: Request):
+    row = store.get_sandbox(sandbox_id)
+    if not row:
+        return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     ip = runtime.container_ip(sandbox_id)
     return netpolicy.revoke(sandbox_id, ip)
 
@@ -455,6 +554,9 @@ def sandbox_diag(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     raw = request.query_params.get("include")
     include = [s.strip() for s in raw.split(",") if s.strip()] if raw else None
     try:
@@ -483,6 +585,9 @@ async def internal_auto_resume(request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"sandbox not found: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     if row["state"] == "running":
         return {"ok": True, "alreadyRunning": True}
     if row["state"] != "paused":
@@ -501,10 +606,13 @@ async def internal_auto_resume(request: Request):
 # ---------------- hooks (P3) ----------------
 
 @app.get("/sandboxes/{sandbox_id}/hooks/status")
-def sandbox_hook_status(sandbox_id: str):
+def sandbox_hook_status(sandbox_id: str, request: Request):
     row = store.get_sandbox(sandbox_id)
     if not row:
         return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    deny = check_owner(request, row)
+    if deny:
+        return deny
     tpl = store.get_template(row["template_code"])
     hs = json.loads(row.get("hook_state") or "{}")
     return {

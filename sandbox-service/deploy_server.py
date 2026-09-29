@@ -25,14 +25,19 @@ DOMAIN = os.environ.get("SBX_DOMAIN", f"{HOST}.nip.io")
 API_KEYS = _require("SBX_API_KEYS")
 # Optional second key for the official e2b SDK (their client validates the key prefix).
 E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
+# Optional identity binding for multi-tenant isolation (P4).
+API_KEYS_JSON = os.environ.get("SBX_API_KEYS_JSON", "")
 
 SKIP_DIRS = {".venv", "__pycache__", "data", "certs"}
 SKIP_FILES = {".gitignore"}
 
-# Write API_KEYS (+ optional e2b key) into the deployed container's .env
+# Write API_KEYS (+ optional e2b key + optional identity JSON) into .env
 api_keys_csv = API_KEYS + (f",{E2B_KEY}" if E2B_KEY else "")
+env_content = f"API_KEYS={api_keys_csv}\nSANDBOX_DOMAIN={DOMAIN}\n"
+if API_KEYS_JSON:
+    env_content += f"API_KEYS_JSON={API_KEYS_JSON}\n"
 EXTRA = {
-    "deploy/.env": f"API_KEYS={api_keys_csv}\nSANDBOX_DOMAIN={DOMAIN}\n",
+    "deploy/.env": env_content,
 }
 
 
