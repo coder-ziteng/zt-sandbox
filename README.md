@@ -218,6 +218,7 @@ sbx.run_code("print(1+1)")
 | `POST` | `/sandboxes/{id}/refreshes` | 刷新访问 token |
 | `GET` / `POST` / `DELETE` | `/sandboxes/{id}/netpolicy` | 网络白名单 |
 | `POST` | `/sandboxes/{id}/netpolicy/refresh` | 手动重解析 FQDN（CDN 切换） |
+| `GET` | `/sandboxes/{id}/diag` | 沙箱诊断快照（进程 / 资源 / 日志 / 连接 / envd） |
 
 数据面（每个沙箱）：
 
@@ -815,6 +816,97 @@ python sandbox-service/tests/fqdn_smoke.py
 2. **手动 refresh**：`refreshedAt` 推进、`resolved` 返回新 IP
 3. **精确模式不展开**：`example.com` 不会自动塞进 `www.example.com`
 
+### 4.11 Diagnostic API（沙箱侧点查）
+
+> 🆕 P3 引入。给 Agent / 运维一组**只读**端点，一次 round-trip 拿到单个沙箱的全部关键调试状态（容器进程、资源、日志、连接、envd 健康）。
+
+#### 4.11.1 端点
+
+```bash
+# 全部 5 个 section（默认）
+GET /sandboxes/{id}/diag
+
+# 选 section + 调日志行数
+GET /sandboxes/{id}/diag?include=processes,stats,envd&logTail=200
+
+# 404 if sandbox row missing
+```
+
+#### 4.11.2 返回结构
+
+```jsonc
+{
+  "sandboxID": "sbx...",
+  "container": {
+    "id": "abc123...",      // Docker ID 前 12 位
+    "name": "sbx-...",
+    "image": "sandbox/code-interpreter:v1",
+    "status": "running",
+    "created": "2026-09-29T...",
+    "networkMode": "host",  // "host" 或 "bridge"
+    "ipAddress": "127.0.0.1"  // host-network 沙箱固定 127.0.0.1
+  },
+  "processes":  { "count": N, "list": [{"pid":1,"user":"root","time":"00:00","cmd":"/init"}, ...] },
+  "stats": {
+    "cpuPct": 0.5,            // null 表示容器刚起 / precpu 缺失
+    "memUsageBytes": 12345678,
+    "memLimitBytes": 2147483648,
+    "memPct": 0.57,
+    "netRxBytes": 1024,
+    "netTxBytes": 2048,
+    "blockReadBytes": 0,
+    "blockWriteBytes": 4096,
+    "ts": 1790652443.36
+  },
+  "logs": {
+    "stdout": "...",         // 最近 N 行（默认 100）
+    "stderr": "...",
+    "linesShown": 100,
+    "truncated": true        // Docker tail 不知道总数,总假设截断
+  },
+  "connections": {
+    "count": N,               // 容器内 tcp 监听 / 连接数
+    "list": [{"proto":"tcp","local":"0.0.0.0:20000","remote":"0.0.0.0:0","state":"LISTEN","pid":null,"cmd":null}, ...],
+    "source": "proc/net"      // 数据来源: "ss/netstat" 或 "proc/net" (容器无 ss 时 fallback 到 /proc/net/tcp)
+  },
+  "envd": {
+    "reachable": true,
+    "statusCode": 200,
+    "latencyMs": 12.4,
+    "raw": {"ok": true}       // envd /health 的原始 JSON
+  },
+  "ts": 1790652443.36
+}
+```
+
+#### 4.11.3 设计取舍
+
+- **5 个 section 独立失败**：容器 paused / exited 时 `top()` 和 `stats()` 会失败，但 `logs()` 和 `envd` 探测仍然可读，失败的 section 返回 `{"error": "..."}` 不影响其他。
+- **`ss` 走 exec_run**：容器 netns 内执行 `ss -tlnp`（退到 `netstat`），所以能拿到容器进程视角的监听端口，而不是宿主的。
+- **无 `ss` / `netstat` 时退到 `/proc/net/tcp`**：Linux 容器必有 procfs，所以 connections 节永远能工作；代价是没有 cmd/pid 字段（`pid` / `cmd` 为 null）。host-network 沙箱由于共享宿主机 netns，会看到宿主的全部监听端口（如 8902 / 22 / 80 / 443）。
+- **`cpuPct` 可为 null**：Docker stats 需要两个采样点（`cpu_stats` / `precpu_stats`）的差值，容器刚启动或 stats 调用时还没采集到第二次样本时会算不出来。
+- **不做 tail streaming**：每次请求拿一份切片；想要"持续 tail"应该走日志聚合方案（不在 P3 范围）。
+- **不做 metrics 聚合 / 持久化**：那是 OTLP 那块（见 P3 剩余候选）。
+
+#### 4.11.4 端到端冒烟
+
+```bash
+python sandbox-service/tests/diag_smoke.py
+```
+
+跑 10 项：
+
+1. 默认 GET 返回 5 section + container meta
+2. `stats` 字段全 numeric + `memLimitBytes > 0`
+3. `processes` 至少 1 条 + 含 python/init/sh
+4. `connections` 命中 envd 监听端口（`:49983`）
+5. `envd` 探测 reachable=true + latencyMs 有值
+6. `logs` stdout/stderr 是 string + `?logTail=50` 生效
+7. `?include=processes,envd` 子集生效
+8. 未知 section 返回 error + valid 列表
+9. 不存在的 sandbox → 404
+10. 两次采样 netRx/netTx 单调不减
+
 ---
 
 ## 5. 镜像矩阵
@@ -846,6 +938,7 @@ python sandbox-service/tests/fqdn_smoke.py
 | **P3 Lifecycle Hook** | `tests/hook_smoke.py` | **startup fail-closed 回滚 + periodic 节拍触发（5 项）** |
 | **P3 Ingress Keepalive** | `tests/keepalive_smoke.py` | **paused 沙箱自动唤醒（4 项：wake vs fast path 时延对比 + 二次唤醒循环 + 幂等）** |
 | **P3 FQDN Allowlist** | `tests/fqdn_smoke.py` | **通配符展开 + CDN 切换 refresh + 精确模式不展开（3 项）** |
+| **P3 Diagnostic API** | `tests/diag_smoke.py` | **5 section 独立采集 + subset + 404 + 计数器单调性（10 项）** |
 
 运行：
 ```bash
@@ -862,6 +955,7 @@ python tests/p2_smoke.py criu                  # 只跑 CRIU
 python tests/mcp_smoke.py                      # MCP 集成冒烟
 python tests/hook_smoke.py                     # 钩子 + watchdog
 python tests/fqdn_smoke.py                    # FQDN 通配符 + CDN refresh
+python tests/diag_smoke.py                    # 沙箱诊断快照
 ```
 
 ---

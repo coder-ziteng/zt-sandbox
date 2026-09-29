@@ -10,6 +10,7 @@ import time
 from datetime import datetime, timezone
 
 import netpolicy
+import diagnostics
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
@@ -393,6 +394,36 @@ def refresh_netpolicy(sandbox_id: str):
 def del_netpolicy(sandbox_id: str):
     ip = runtime.container_ip(sandbox_id)
     return netpolicy.revoke(sandbox_id, ip)
+
+
+@app.get("/sandboxes/{sandbox_id}/diag")
+def sandbox_diag(sandbox_id: str, request: Request):
+    """Per-sandbox diagnostic snapshot — point-in-time introspection.
+
+    Query params:
+      include    comma-separated subset of:
+                 processes, stats, logs, connections, envd
+                 (default: all five)
+      logTail    int, default 100 (only used when 'logs' is in include)
+
+    Sections are collected independently — a failure in one does not
+    stop the others, it just shows up as {"error": "..."} in that slot.
+    """
+    row = store.get_sandbox(sandbox_id)
+    if not row:
+        return err(100003, f"沙箱不存在: {sandbox_id}", 404)
+    raw = request.query_params.get("include")
+    include = [s.strip() for s in raw.split(",") if s.strip()] if raw else None
+    try:
+        log_tail = int(request.query_params.get("logTail", "100"))
+    except ValueError:
+        return err(100008, "logTail must be int", 400)
+    return diagnostics.gather(
+        sandbox_id,
+        include=include,
+        log_tail=log_tail,
+        host_port_envd=row.get("host_port_envd"),
+    )
 
 
 @app.post("/internal/auto-resume")
