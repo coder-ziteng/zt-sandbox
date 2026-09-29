@@ -252,6 +252,40 @@ sbx.run_code("print(1+1)")
 
 ![Chat 会话生命周期泳道图](docs/diagrams/Chat会话生命周期_泳道图.png)
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor CP as Chat 平台
+    participant CTRL as 控制面 (FastAPI)
+    participant DB as SQLite
+    participant DOCKER as Docker daemon
+    participant PROXY as Edge Proxy (:443)
+    participant ENVD as envd (容器内)
+
+    Note over CP: 用户开了一个新对话 → 生成 sessionId
+    CP->>CTRL: POST /sandboxes {templateID, sessionId, timeout}
+    CTRL->>DB: SELECT 同 (owner,tenant,sessionId) 的 running 沙箱
+    DB-->>CTRL: 无（首次）
+    CTRL->>DOCKER: create_container + start
+    DOCKER-->>CTRL: container_id
+    CTRL->>DB: INSERT sandboxes (session_id=chat-A)
+    CTRL-->>CP: 201 {sandboxID, envdAccessToken, domain, sessionID}
+
+    Note over CP: 多轮对话 — 复用同一沙箱
+    CP->>PROXY: GET https://49983-{sid}.{domain}/files?path=...
+    Note over PROXY: 解析子域 → 查 DB → 校验 X-Session-Id
+    PROXY->>DB: SELECT session_id WHERE sandbox_id=...
+    PROXY->>ENVD: forward to 127.0.0.1:hostPort
+    ENVD-->>PROXY: 200 + body
+    PROXY-->>CP: 200
+
+    Note over CP: 会话结束 → 释放
+    CP->>CTRL: DELETE /sandboxes/{sid} + X-Session-Id
+    CTRL->>DOCKER: rm container
+    CTRL->>DB: DELETE row + release ports
+    CTRL-->>CP: 204
+```
+
 关键细节：`POST /sandboxes` 携带 `sessionId` → 控制面查重（同 owner/tenant/session 已有 running 则 409）→ 起容器 → 落库带 `session_id` → 返回 201。多轮对话经 `https://49983-{sid}.{domain}/...` 访问，Edge Proxy 解析子域后查 DB 校验 `X-Session-Id` 再转发 envd。`DELETE` 时删容器、删行、释放端口，返回 204。
 
 ### 3.4.2 数据面鉴权决策（流程图）
@@ -260,15 +294,80 @@ sbx.run_code("print(1+1)")
 
 ![数据面鉴权决策流程图](docs/diagrams/数据面鉴权链_业务流程图.png)
 
+```mermaid
+flowchart TD
+    R[请求到达 :8902] --> P{路径?}
+    P -->|/admin/*| A1{ADMIN_TOKEN 已配?}
+    A1 -->|否| E503[503 100012<br/>admin 未启用]
+    A1 -->|是| A2{X-Admin-Token 匹配?}
+    A2 -->|否| E401[401 100012]
+    A2 -->|是| OK1[执行 /admin/* handler]
+
+    P -->|/health 或 /metrics 或 /internal/*| PASS[无鉴权直通]
+
+    P -->|其它数据面路径| D1{Authorization 或 X-API-KEY?}
+    D1 -->|都没有| E401b[401 100001]
+    D1 -->|有| D2{DB 查 key_hash 命中?}
+    D2 -->|是| ID1[owner,tenant ← DB row]
+    D2 -->|否, 回退 env API_KEYS| D3{在列表里?}
+    D3 -->|否| E401c[401 100001]
+    D3 -->|是| ID2[owner,tenant ← API_KEYS_JSON<br/>否则 default/default]
+
+    ID1 --> SC{路径含 /sandboxes/sid?}
+    ID2 --> SC
+    SC -->|是| Q{沙箱绑 session?}
+    Q -->|否, legacy| HANDLER[进入 handler]
+    Q -->|是| X{X-Session-Id 匹配?}
+    X -->|否, 缺或错| E403[403 100013]
+    X -->|是| HANDLER
+    SC -->|否| HANDLER
+```
+
 ### 3.4.3 paused 沙箱被入站请求自动唤醒（P3 keepalive 时序图）
 
 ![paused 沙箱入站自动唤醒时序图](docs/diagrams/keepalive自动唤醒_时序图.png)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as 客户端
+    participant PX as Edge Proxy
+    participant CT as 控制面<br/>/internal/auto-resume
+    participant DB as SQLite
+    participant DK as Docker
+
+    Note over DB: sandboxes.state = paused
+    C->>PX: TLS 443 → https://49983-{sid}.{domain}/health
+    PX->>DB: SELECT host_port_envd (port_allocations)
+    PX->>PX: connect 127.0.0.1:hostPort
+    PX-->>PX: ConnectionRefused (容器停着)
+    PX->>CT: POST /internal/auto-resume?sandbox={sid}
+    CT->>DB: SELECT row
+    CT->>DK: 走 pause_mode 路径:<br/>CRIU restore 或 docker start
+    DK-->>CT: container running
+    CT->>DB: UPDATE state=running, last_activity=now
+    CT-->>PX: 200 {ok:true}
+    PX->>PX: retry open_connection (成功)
+    PX->>PX: 双向 pipe 透传
+    PX-->>C: 200 + body
+```
 
 > 客户端无感：不需要先 `POST /resume` 再用；第一次连接慢约 1-3 s（CRIU 还原），之后毫秒级。
 
 ### 3.4.4 沙箱生命周期状态机
 
 ![沙箱生命周期状态机](docs/diagrams/沙箱状态机_分组图.png)
+
+```mermaid
+stateDiagram-v2
+    [*] --> running: POST /sandboxes
+    running --> running: POST /refreshes<br/>POST /timeout
+    running --> paused: POST /pause<br/>(CRIU 或 stop)
+    running --> killed: TTL 到期<br/>或 DELETE
+    paused --> running: POST /resume<br/>POST /connect<br/>或 edge-proxy 自动唤醒
+    paused --> killed: DELETE / TTL
+    killed --> [*]: 资源释放
+```
 
 > `killed` 不是 DB 中的实际状态值 — 行被直接 `DELETE`；这里画图表示端口/容器都回收了。
 
