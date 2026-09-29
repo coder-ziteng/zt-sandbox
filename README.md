@@ -14,6 +14,8 @@
 
 ## 0. 速查
 
+> 📖 **端点级参考**：每个 REST 端点的请求体/响应字段/错误码全部独立成册，见 [zt_sandbox_api_doc.md](zt_sandbox_api_doc.md)。本节及 §4 偏概念与场景，§3.4 给出调用流程图。
+
 | 项 | 值 |
 |---|---|
 | 服务器 | `${SBX_SSH_HOST}`（内网 Linux，root / 123456） |
@@ -194,60 +196,168 @@ sbx.run_code("print(1+1)")
 
 ---
 
-## 3.2 管控面 API 速查
+## 3.2 端点清单（按能力分组）
 
-> **鉴权**：所有端点（除 `/health`）都需要 `Authorization: Bearer <key>` **或** `X-API-KEY: <key>`。
-> e2b SDK 只发后者，REST/curl 用前者。
+> 详细的请求/响应字段、错误码、curl 示例全部在 [zt_sandbox_api_doc.md](zt_sandbox_api_doc.md)。本节只列能力分组 → 章节。
 
-| 方法 | 路径 | 用途 |
-|---|---|---|
-| `GET` | `/health` | 健康检查 + 容量 + 能力（`criu` / `netpolicy`） |
-| `GET` | `/v2/templates` | 列出已注册模板（含 `browserEnabled` 等） |
-| `GET` | `/templates/{code}` | 模板详情 |
-| `POST` | `/v3/templates` | 创建/注册模板（支持 `networkPolicy`） |
-| `DELETE` | `/templates/{code}` | 删除模板 |
-| `GET` | `/templates/{code}/builds/{build_id}/status` | 模板构建进度 |
-| `POST` | `/sandboxes` | **创建沙箱**（`templateID` + `timeout`），返回 `sandboxID` + `envdAccessToken` |
-| `GET` | `/v2/sandboxes` | 列出所有沙箱 |
-| `GET` | `/sandboxes/{id}` | 沙箱详情（含 `state` / `pauseMode`） |
-| `GET` | `/sandboxes/{id}/health` | 沙箱就绪探针（`ok` / `services`） |
-| `POST` | `/sandboxes/{id}/connect` | 重新拿 token |
-| `POST` | `/sandboxes/{id}/pause` | 暂停（CRIU，失败降级 stop） |
-| `POST` | `/sandboxes/{id}/resume` | 恢复 |
-| `DELETE` | `/sandboxes/{id}` | 销毁 |
-| `POST` | `/sandboxes/{id}/timeout` | 续期 TTL（秒） |
-| `POST` | `/sandboxes/{id}/refreshes` | 刷新访问 token |
-| `GET` / `POST` / `DELETE` | `/sandboxes/{id}/netpolicy` | 网络白名单 |
-| `POST` | `/sandboxes/{id}/netpolicy/refresh` | 手动重解析 FQDN（CDN 切换） |
-| `GET` | `/sandboxes/{id}/diag` | 沙箱诊断快照（进程 / 资源 / 日志 / 连接 / envd） |
-| `GET` | `/metrics` | Prometheus 可抓取的控制面指标（无需鉴权） |
+| 能力 | 端点族 | 详见手册 |
+| --- | --- | --- |
+| 模板管理 | `/v3/templates`、`/v2/templates`、`/templates/{code}`、`/templates/{code}/hooks` | §2 |
+| 沙箱生命周期 | `/sandboxes`、`/sandboxes/{sid}[/health,/connect,/pause,/resume,/timeout,/refreshes]` | §3 |
+| 网络策略 | `/sandboxes/{sid}/netpolicy[/refresh]` | §4 |
+| 诊断与钩子 | `/sandboxes/{sid}/diag`、`/sandboxes/{sid}/hooks/status` | §5 |
+| Admin Key 管理 | `/admin/keys`（GET/POST/DELETE） | §6 |
+| Chat-Session 隔离 | `sessionId` 字段 + `X-Session-Id` 头 | §7 |
+| 数据面（容器内 envd） | `/health`、`/files`、`/process.Process/*`、`/filesystem.Filesystem/*` | §8 |
 
-数据面（每个沙箱）：
+数据面（每沙箱独占 3 端口）：
 
-| 端口 | 协议 | 用途 | 入口 |
+| 端口标签 | 协议 | 用途 | edge-proxy 子域 |
 | --- | --- | --- | --- |
-| 49983 | ConnectRPC JSON + `/files` | envd 文件/进程 | `https://49983-{sid}.${DOMAIN}` |
-| 49999 | Jupyter | run_code | `https://49999-{sid}.${DOMAIN}` |
-| 3000 | HTTP + WS | Chromium CDP + Session API | `https://3000-{sid}.${DOMAIN}` |
+| 49983 | ConnectRPC JSON + `/files` | envd 文件 / 进程 | `https://49983-{sid}.${DOMAIN}` |
+| 49999 | Jupyter kernel | run_code | `https://49999-{sid}.${DOMAIN}` |
+| 3000 | HTTP + WS | Chromium CDP | `https://3000-{sid}.${DOMAIN}` |
+
+鉴权速记：
+
+- 数据面 `Authorization: Bearer ${API_KEY}` 或 `X-API-KEY: ${API_KEY}`（SDK 用后者）
+- 管理面 `X-Admin-Token: ${ADMIN_TOKEN}`（仅 `/admin/*` 接受）
+- 数据面（容器内） `x-access-token: ${envdAccessToken}` + 可选 `X-Session-Id: ${sessionId}`
+- 三个凭据互不替换
 
 ---
 
-## 3.3 错误码
+## 3.3 错误码速记
 
-响应体统一格式：`{"code": <int>, "message": <str>, "requestID": <str>}`。
+响应统一 `{code, message, requestID}`。完整对照见 [zt_sandbox_api_doc.md §9](zt_sandbox_api_doc.md)。
 
-| code | 含义 | HTTP | 触发场景 |
-| --- | --- | --- | --- |
-| 100001 | API Key 无效 | 401 | key 不在 `API_KEYS` / header 缺失 |
-| 100002 | 模版不存在 | 404 | `templateID` 未注册 |
-| 100003 | 沙箱不存在 | 404 | 已销毁 / ID 写错 |
-| 100004 | 参数缺失或非法 | 400 | 缺 `templateID` / `timeout` 等 |
-| 100005 | 沙箱启动失败 | 500 | 镜像拉失败 / 端口冲突 |
-| 100006 | 恢复失败 | 404 / 503 | CRIU 镜像损坏 / container 不存在 |
-| 100007 | 有依赖不能删 | 409 | 还有子引用 |
-| 100009 | 配额满 | 429 | `MAX_SANDBOXES` / `MAX_MEMORY_MB` 超限 |
+| 类别 | code 段 | HTTP |
+| --- | --- | --- |
+| 鉴权 / 身份 | `100001` 缺 key / `100011` 跨 owner-tenant / `100012` admin 失败 / `100013` session 失败 | 401 / 403 / 503 |
+| 资源 | `100002` 模板 / `100003` 沙箱 / `100014` key 不存在 | 404 |
+| 参数 | `100004` 缺字段 / `100008` 解析错 | 400 |
+| 生命周期 | `100005` 启动 / `100006` 恢复 / `100010` hook 失败 | 500 / 503 |
+| 冲突 | `100007` 模板有依赖 / `100015` session 已占 | 409 |
+| 配额 | `100009` 数量/内存超限 | 429 |
 
-429 配额满：先 `DELETE` 不用的沙箱，或减小 `memoryMB` 重试。
+---
+
+## 3.4 调用逻辑图
+
+下面四张图给出常见路径的"为什么这么调"。读端点字段请回到手册；这里关注流程。
+
+### 3.4.1 一次 Chat 会话的完整生命周期（泳道图）
+
+5 个角色协作，每行一个泳道。`chat 平台` = 调用方后端；`控制面` = `:8902`；`edge-proxy` = `:443` TLS 转发；`envd` = 容器内守护；`docker` = 宿主机 daemon。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor CP as Chat 平台
+    participant CTRL as 控制面 (FastAPI)
+    participant DB as SQLite
+    participant DOCKER as Docker daemon
+    participant PROXY as Edge Proxy (:443)
+    participant ENVD as envd (容器内)
+
+    Note over CP: 用户开了一个新对话 → 生成 sessionId
+    CP->>CTRL: POST /sandboxes {templateID, sessionId, timeout}
+    CTRL->>DB: SELECT 同 (owner,tenant,sessionId) 的 running 沙箱
+    DB-->>CTRL: 无（首次）
+    CTRL->>DOCKER: create_container + start
+    DOCKER-->>CTRL: container_id
+    CTRL->>DB: INSERT sandboxes (session_id=chat-A)
+    CTRL-->>CP: 201 {sandboxID, envdAccessToken, domain, sessionID}
+
+    Note over CP: 多轮对话 — 复用同一沙箱
+    CP->>PROXY: GET https://49983-{sid}.{domain}/files?path=...
+    Note over PROXY: 解析子域 → 查 DB → 校验 X-Session-Id
+    PROXY->>DB: SELECT session_id WHERE sandbox_id=...
+    PROXY->>ENVD: forward to 127.0.0.1:hostPort
+    ENVD-->>PROXY: 200 + body
+    PROXY-->>CP: 200
+
+    Note over CP: 会话结束 → 释放
+    CP->>CTRL: DELETE /sandboxes/{sid} + X-Session-Id
+    CTRL->>DOCKER: rm container
+    CTRL->>DB: DELETE row + release ports
+    CTRL-->>CP: 204
+```
+
+### 3.4.2 鉴权决策（流程图）
+
+```mermaid
+flowchart TD
+    R[请求到达 :8902] --> P{路径?}
+    P -->|/admin/*| A1{ADMIN_TOKEN 已配?}
+    A1 -->|否| E503[503 100012<br/>admin 未启用]
+    A1 -->|是| A2{X-Admin-Token 匹配?}
+    A2 -->|否| E401[401 100012]
+    A2 -->|是| OK1[执行 /admin/* handler]
+
+    P -->|/health 或 /metrics 或 /internal/*| PASS[无鉴权直通]
+
+    P -->|其它数据面路径| D1{Authorization 或 X-API-KEY?}
+    D1 -->|都没有| E401b[401 100001]
+    D1 -->|有| D2{DB 查 key_hash 命中?}
+    D2 -->|是| ID1[owner,tenant ← DB row]
+    D2 -->|否, 回退 env API_KEYS| D3{在列表里?}
+    D3 -->|否| E401c[401 100001]
+    D3 -->|是| ID2[owner,tenant ← API_KEYS_JSON<br/>否则 default/default]
+
+    ID1 --> SC{路径含 /sandboxes/sid?}
+    ID2 --> SC
+    SC -->|是| Q{沙箱绑 session?}
+    Q -->|否, legacy| HANDLER[进入 handler]
+    Q -->|是| X{X-Session-Id 匹配?}
+    X -->|否, 缺或错| E403[403 100013]
+    X -->|是| HANDLER
+    SC -->|否| HANDLER
+```
+
+### 3.4.3 paused 沙箱被入站请求自动唤醒（P3 keepalive 时序图）
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor C as 客户端
+    participant PX as Edge Proxy
+    participant CT as 控制面<br/>/internal/auto-resume
+    participant DB as SQLite
+    participant DK as Docker
+
+    Note over DB: sandboxes.state = paused
+    C->>PX: TLS 443 → https://49983-{sid}.{domain}/health
+    PX->>DB: SELECT host_port_envd (port_allocations)
+    PX->>PX: connect 127.0.0.1:hostPort
+    PX-->>PX: ConnectionRefused (容器停着)
+    PX->>CT: POST /internal/auto-resume?sandbox={sid}
+    CT->>DB: SELECT row
+    CT->>DK: 走 pause_mode 路径:<br/>CRIU restore 或 docker start
+    DK-->>CT: container running
+    CT->>DB: UPDATE state=running, last_activity=now
+    CT-->>PX: 200 {ok:true}
+    PX->>PX: retry open_connection (成功)
+    PX->>PX: 双向 pipe 透传
+    PX-->>C: 200 + body
+```
+
+> 客户端无感：不需要先 `POST /resume` 再用；第一次连接慢约 1-3 s（CRIU 还原），之后毫秒级。
+
+### 3.4.4 沙箱生命周期状态机
+
+```mermaid
+stateDiagram-v2
+    [*] --> running: POST /sandboxes
+    running --> running: POST /refreshes<br/>POST /timeout
+    running --> paused: POST /pause<br/>(CRIU 或 stop)
+    running --> killed: TTL 到期<br/>或 DELETE
+    paused --> running: POST /resume<br/>POST /connect<br/>或 edge-proxy 自动唤醒
+    paused --> killed: DELETE / TTL
+    killed --> [*]: 资源释放
+```
+
+> `killed` 不是 DB 中的实际状态值 — 行被直接 `DELETE`；这里画图表示端口/容器都回收了。
 
 ---
 
@@ -432,6 +542,8 @@ cap = httpx.get(f"{API}/health", headers=H).json()
 ---
 
 ### 4.6 获取沙箱产出物（文件下载）
+
+> 端点请求体与 ConnectRPC 方法签名见 [zt_sandbox_api_doc.md §8](zt_sandbox_api_doc.md)。本节只讲"怎么把文件拿出来"的三种姿势。
 
 代码跑完后，生成在沙箱里的文件怎么拿回来：
 
@@ -1038,38 +1150,19 @@ python sandbox-service/tests/session_smoke.py       # 14 项: chat-session 隔�
 
 #### 4.13.5 Key 管理入口 (`/admin/keys`, P4 第五刀)
 
-API Key 本身是「一次性 mint 之后无法再读」的秘密,绝不能通过普通数据面 API 直接查询 — 否则任何持有 API Key 的第三方就能枚举出其他所有人的 key。所以 **key 的生命周期管理走专用入口**:
+API Key 本身是「一次性 mint 之后无法再读」的秘密，绝不能通过普通数据面 API 直接查询 — 否则任何持有 API Key 的第三方就能枚举出其他所有人的 key。所以 **key 的生命周期管理走专用入口**，端点细节与示例见 [zt_sandbox_api_doc.md §6](zt_sandbox_api_doc.md)。
 
-| 端点 | 方法 | 凭据 | 作用 |
-|---|---|---|---|
-| `/admin/keys` | GET | `X-Admin-Token` | 列出当前 active keys,**只回显** `prefix…suffix` + 元数据 |
-| `/admin/keys` | POST | `X-Admin-Token` | 创建新 key。**完整 plaintext 仅此一次返回**;之后 list 永远看不到 |
-| `/admin/keys/{id}` | DELETE | `X-Admin-Token` | 立即撤销 — 下次请求即 401 |
+**三条不变量**：
 
-凭据 (`ADMIN_TOKEN`) 与 `API_KEYS` 完全隔离 — 数据面 key 在 `/admin/*` 上**显式被拒**(401, 不是 403),即使数据面 key 泄漏也无法用来 mint/revoke。
+- 凭据 `ADMIN_TOKEN` 与数据面 `API_KEYS` **完全隔离** — 数据面 key 在 `/admin/*` 上**显式 401**（不是 403），即使数据面 key 泄漏也无法 mint/revoke。
+- 明文 key 仅 `POST /admin/keys` 时一次性返回；之后 list 永远只看到 `prefix…suffix`。底层存 `api_keys` 表的 SHA-256 hash，撤销等同永久销毁。
+- 向后兼容：启动时 `API_KEYS_JSON` 中的 env key 被自动 idempotent 导入 `api_keys` 表，之后通过 `/admin/keys` 接管。
 
-启动:
+`.env` 配置（`ADMIN_TOKEN` 留空时 `deploy_server.py` 自动生成并打印一次）：
 
 ```bash
-# .env (或 docker-compose env):
-ADMIN_TOKEN=adm_xxx...          # 留空时 deploy_server.py 自动生成并打印一次
-
-# 列表 (看不到完整 key,只看前缀+后缀):
-curl -H "X-Admin-Token: $ADMIN_TOKEN" http://host:8902/admin/keys
-
-# 创建 (会拿到完整 plaintext,必须立即保存):
-curl -X POST -H "X-Admin-Token: $ADMIN_TOKEN" -H "Content-Type: application/json" \
-  -d '{"owner":"alice","tenant":"acme","label":"prod-bot"}' \
-  http://host:8902/admin/keys
-# → {"key":"e2b_k_..._...","meta":{...},"warning":"完整 key 仅此一次返回..."}
-
-# 撤销:
-curl -X DELETE -H "X-Admin-Token: $ADMIN_TOKEN" http://host:8902/admin/keys/k_xxxxxxxx
+ADMIN_TOKEN=adm_xxx...
 ```
-
-底层存 `api_keys` 表 (`id, key_hash(SHA-256), prefix, suffix, owner, tenant, label, created_at, revoked_at, last_used_at`)。**明文 key 不入库** — 撤销等同于永久销毁,无法再找回。
-
-向后兼容:已有的 `API_KEYS_JSON` 环境变量 key 启动时被自动导入 `api_keys` 表(idempotent),之后通过 `/admin/keys` 接管。
 
 #### 4.13.6 Chat-Session 隔离 (`sessionId` + `X-Session-Id`, P4 第六刀)
 
@@ -1077,37 +1170,16 @@ curl -X DELETE -H "X-Admin-Token: $ADMIN_TOKEN" http://host:8902/admin/keys/k_xx
 
 **模型**：`Session = Sandbox`（E2B 官方语义），客户端拥有 `sessionId ↔ sandboxId` 映射。
 
-**三个改动点**：
+**四处强制点**（端点参数与示例 curl 见 [zt_sandbox_api_doc.md §7 §11.1](zt_sandbox_api_doc.md)；调用流程图见本文 [§3.4.1 §3.4.2](#34-调用逻辑图)）：
 
 | 层 | 改动 | 作用 |
-|---|---|---|
-| `POST /sandboxes` | 接受 `sessionId` (或 `session_id`) | 创建沙箱时绑定会话；同 (owner, tenant, sessionId) 已存在 running/paused 沙箱 → 409 |
-| `GET /sandboxes/{sid}` 等所有生命周期端点 | 校验请求头 `X-Session-Id` | 绑定沙箱强制要求 header；不匹配 403；未绑定的 legacy 沙箱跳过 |
+| --- | --- | --- |
+| `POST /sandboxes` | 接受 `sessionId`（或 `session_id`） | 创建沙箱时绑定会话；同 (owner, tenant, sessionId) 已存在 running/paused 沙箱 → 409 `100015` |
+| `GET /sandboxes/{sid}` 等所有生命周期端点 | 校验请求头 `X-Session-Id` | 绑定沙箱强制要求 header；不匹配 403 `100013`；未绑定的 legacy 沙箱跳过 |
 | `GET /v2/sandboxes` | 当 `X-Session-Id` 存在时按会话过滤 | 只返回当前会话的沙箱；不带 header = admin 视图返回全部 |
 | edge-proxy (`{port}-{sid}.{domain}`) | 转发前查 `sandboxes.session_id` | 若绑定则要求 `X-Session-Id` 匹配，否则 403 直接返回，**根本不进容器** |
 
-**调用样式**：
-
-```bash
-# 1. 新会话开始:创建沙箱并绑定 sessionId
-curl -X POST http://host:8902/sandboxes \
-  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
-  -d '{"templateID":"code-interpreter","sessionId":"chat-A-7b3c9d"}'
-# → {"sandboxID":"sbx…","envdAccessToken":"…","sessionID":"chat-A-7b3c9d",…}
-
-# 2. 同一会话内的多轮对话:复用 sandbox,每次带 X-Session-Id
-curl http://host:8902/sandboxes/sbx…/health \
-  -H "Authorization: Bearer $API_KEY" -H "X-Session-Id: chat-A-7b3c9d"
-
-# 3. 数据面文件操作也要带 (edge-proxy 校验)
-curl https://49983-sbx….${DOMAIN}/files?path=/workspace/report.pdf \
-  -H "x-access-token: $ENVD_TOKEN" \
-  -H "X-Session-Id: chat-A-7b3c9d"
-
-# 4. 列出本会话的沙箱 (跨会话不可见)
-curl http://host:8902/v2/sandboxes \
-  -H "Authorization: Bearer $API_KEY" -H "X-Session-Id: chat-A-7b3c9d"
-```
+**向后兼容**：旧沙箱（`session_id IS NULL`）不受任何 session 校验影响；不带 `sessionId` 创建出来的新沙箱也是 legacy 行为。
 
 **Session ID 命名建议**：用对话平台已有的 UUID / 雪花 ID，加前缀便于排错（如 `chat-A-7b3c9d`、`web-thread-xxx`）。沙箱销毁后同一 `sessionId` 可重新绑定（`running|paused` 才视为占用）。
 
