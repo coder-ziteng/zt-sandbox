@@ -51,6 +51,20 @@ def resolve_route(sandbox_id: str, container_port: int):
     return None
 
 
+def lookup_session(sandbox_id: str):
+    """Return the bound session_id for this sandbox (None if unbound/legacy or
+    sandbox unknown). Used to enforce chat-session isolation at the edge."""
+    conn = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
+    conn.execute("PRAGMA busy_timeout=10000")
+    try:
+        row = conn.execute(
+            "SELECT session_id FROM sandboxes WHERE sandbox_id=?", (sandbox_id,)
+        ).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
 def parse_host(host_header: str):
     host = host_header.split(":")[0]
     labels = host.split(".")
@@ -135,6 +149,7 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         content_length = 0
         chunked = False
         upgrade = False
+        session_header = ""
         for h in headers_raw:
             k, _, v = h.decode("latin-1").partition(":")
             k = k.strip().lower()
@@ -147,6 +162,8 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
                 chunked = True
             elif k == "upgrade":
                 upgrade = True
+            elif k == "x-session-id":
+                session_header = v
 
         route = parse_host(host_header)
         if route is None:
@@ -166,6 +183,23 @@ async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
             body = b'{"code":100003,"message":"sandbox not found"}'
             writer.write(
                 b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: "
+                + str(len(body)).encode() + b"\r\n\r\n" + body
+            )
+            await writer.drain()
+            return
+
+        # P4 第六刀: chat-session isolation. If this sandbox is bound to a
+        # session, require a matching X-Session-Id header; otherwise reject.
+        # Unbound sandboxes (session_id IS NULL) skip the check.
+        bound_session = await asyncio.get_event_loop().run_in_executor(
+            None, lookup_session, sandbox_id
+        )
+        if bound_session and bound_session != session_header:
+            log.warning("session deny: sandbox=%s bound=%s presented=%s",
+                        sandbox_id, bound_session, session_header or "<none>")
+            body = b'{"code":100013,"message":"X-Session-Id missing or mismatched"}'
+            writer.write(
+                b"HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: "
                 + str(len(body)).encode() + b"\r\n\r\n" + body
             )
             await writer.drain()

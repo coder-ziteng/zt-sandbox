@@ -150,13 +150,25 @@ def caller_identity(request: Request) -> tuple[str, str]:
 
 
 def check_owner(request: Request, row: dict):
-    """Enforce sandbox-ownership in multi-tenant mode.
+    """Enforce (a) chat-session binding and (b) owner/tenant isolation on a
+    sandbox row. Returns None on pass, or 403 JSONResponse.
 
-    Returns None on pass, or a 403 JSONResponse when the caller's identity
-    (from API_KEYS_JSON) does not match the row's stored (owner, tenant).
-    In legacy single-key mode (ISOLATION_ENABLED=False), everyone maps to
-    (default, default) and the check is a no-op.
+    Session check (P4 第六刀) applies to ALL modes whenever the row is bound
+    to a session_id — the caller must present a matching X-Session-Id header.
+    Unbound (legacy) sandboxes pass through.
+
+    Owner/tenant check (P4 第四刀) is skipped in legacy single-key mode
+    (ISOLATION_ENABLED=False) — everyone maps to (default, default).
     """
+    row_session = (row.get("session_id") if row else None) or None
+    if row_session:
+        req_session = request.headers.get("x-session-id", "").strip()
+        if not req_session:
+            return err(100013, "沙箱绑定了 session, 请提供 X-Session-Id header", 403)
+        if req_session != row_session:
+            return err(100013,
+                       f"X-Session-Id 不匹配 (caller={req_session}, sandbox={row_session})",
+                       403)
     if not ISOLATION_ENABLED:
         return None
     row_owner = (row.get("owner") if row else None) or "default"
@@ -209,6 +221,8 @@ def sandbox_json(row: dict, with_token: bool = True) -> dict:
         "features": row.get("features") or "envd,jupyter",
         "pauseMode": row.get("pause_mode") or "stop",
     }
+    if row.get("session_id"):
+        d["sessionID"] = row["session_id"]
     if row.get("host_port_browser"):
         d["browserPort"] = 3000
     if with_token:
@@ -309,6 +323,19 @@ async def create_sandbox(request: Request):
     env_vars = body.get("env_vars") or {}
     client_id = store.new_id("cli")
 
+    # P4 第六刀: optional chat-session binding. Same (owner, tenant, sessionId)
+    # cannot have two live sandboxes at once — the caller's chat platform owns
+    # the session→sandbox mapping.
+    session_id = (body.get("sessionId") or body.get("session_id") or "").strip() or None
+    if session_id:
+        owner_, tenant_ = caller_identity(request)
+        existing = store.find_active_sandbox_by_session(owner_, tenant_, session_id)
+        if existing:
+            return err(100015,
+                       f"该 session 已有沙箱 (sandboxID={existing['sandbox_id']}); "
+                       f"复用或先销毁",
+                       409)
+
     sandbox_id = store.new_id("sbx")
     envd_token = store.new_id("tok")
     ports = store.allocate_ports(sandbox_id)
@@ -349,7 +376,8 @@ async def create_sandbox(request: Request):
     store.create_sandbox(sandbox_id, template_id, client_id, envd_token, list(ports), metadata,
                          f"sbx-{sandbox_id}", timeout, features=features,
                          owner=caller_identity(request)[0],
-                         tenant=caller_identity(request)[1])
+                         tenant=caller_identity(request)[1],
+                         session_id=session_id)
     if hook_state:
         store.update_sandbox(sandbox_id, hook_state=json.dumps(hook_state))
     row = store.get_sandbox(sandbox_id)
@@ -364,9 +392,14 @@ def list_sandboxes(request: Request):
     state_param = request.query_params.get("state")
     states = [s for s in state_param.split(",")] if state_param else ("running", "paused")
     owner, tenant = caller_identity(request)
+    # P4 第六刀: when X-Session-Id is provided, scope the list to that session
+    # only — other sessions' sandboxes are invisible. Without the header the
+    # caller sees all their own sandboxes (legacy/admin view).
+    session_param = request.headers.get("x-session-id", "").strip() or None
     rows = store.list_sandboxes(tuple(states),
                                 owner=owner if ISOLATION_ENABLED else None,
-                                tenant=tenant if ISOLATION_ENABLED else None)
+                                tenant=tenant if ISOLATION_ENABLED else None,
+                                session_id=session_param)
     return [sandbox_json(r, with_token=False) for r in rows]
 
 

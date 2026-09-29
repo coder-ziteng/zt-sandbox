@@ -65,6 +65,11 @@ def _migrate(c):
         c.execute("ALTER TABLE sandboxes ADD COLUMN owner TEXT NOT NULL DEFAULT 'default'")
     if "tenant" not in scols:
         c.execute("ALTER TABLE sandboxes ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'")
+    if "session_id" not in scols:
+        # P4 第六刀: chat-session isolation. NULL = legacy (no session binding).
+        c.execute("ALTER TABLE sandboxes ADD COLUMN session_id TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_sbx_session "
+                  "ON sandboxes(owner, tenant, session_id) WHERE session_id IS NOT NULL")
 
 
 def _ensure_api_keys(c):
@@ -253,17 +258,18 @@ def get_host_ports(sandbox_id: str):
 # ---------- sandboxes ----------
 
 def create_sandbox(sandbox_id, template_code, client_id, envd_token, ports, metadata, container_name, ttl,
-                   features="envd,jupyter", owner="default", tenant="default"):
+                   features="envd,jupyter", owner="default", tenant="default", session_id=None):
     now = time.time()
     browser_port = ports[2] if len(ports) > 2 else None
     with db() as c:
         c.execute(
             "INSERT INTO sandboxes (sandbox_id,template_code,client_id,envd_token,host_port_envd,host_port_jupyter,"
-            "host_port_browser,metadata,state,started_at,end_at,container_name,features,last_activity,owner,tenant)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "host_port_browser,metadata,state,started_at,end_at,container_name,features,last_activity,owner,tenant,session_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 sandbox_id, template_code, client_id, envd_token, ports[0], ports[1], browser_port,
                 json.dumps(metadata), "running", now, now + ttl, container_name, features, now, owner, tenant,
+                session_id,
             ),
         )
 
@@ -274,7 +280,7 @@ def get_sandbox(sandbox_id: str):
     return dict(row) if row else None
 
 
-def list_sandboxes(states=("running", "paused"), owner=None, tenant=None):
+def list_sandboxes(states=("running", "paused"), owner=None, tenant=None, session_id=None):
     q = ",".join("?" for _ in states)
     clauses = [f"state IN ({q})"]
     params: list = list(states)
@@ -284,12 +290,38 @@ def list_sandboxes(states=("running", "paused"), owner=None, tenant=None):
     if tenant is not None:
         clauses.append("tenant=?")
         params.append(tenant)
+    if session_id is not None:
+        # Session view: only rows bound to this session. NULL rows (legacy) are excluded.
+        clauses.append("session_id=?")
+        params.append(session_id)
     where = " AND ".join(clauses)
     with db() as c:
         rows = c.execute(
             f"SELECT * FROM sandboxes WHERE {where} ORDER BY started_at DESC", params
         ).fetchall()
     return [dict(r) for r in rows]
+
+
+def get_sandbox_session(sandbox_id: str):
+    """Return the bound session_id (or None for legacy sandboxes). Used by edge-proxy."""
+    with db() as c:
+        row = c.execute(
+            "SELECT session_id FROM sandboxes WHERE sandbox_id=?", (sandbox_id,)
+        ).fetchone()
+    return row["session_id"] if row else None
+
+
+def find_active_sandbox_by_session(owner: str, tenant: str, session_id: str):
+    """Return dict for the live (running|paused) sandbox bound to this session, or None.
+    Used to reject duplicate-session creates.
+    """
+    with db() as c:
+        row = c.execute(
+            "SELECT * FROM sandboxes WHERE owner=? AND tenant=? AND session_id=? "
+            "AND state IN ('running','paused')",
+            (owner, tenant, session_id),
+        ).fetchone()
+    return dict(row) if row else None
 
 
 def update_sandbox(sandbox_id: str, **fields):

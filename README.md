@@ -1033,6 +1033,7 @@ chown -R user:user /workspace 2>/dev/null || true
 python sandbox-service/tests/ownership_smoke.py     # 8 项: 跨 owner/tenant 全部 403
 python sandbox-service/tests/path_sandbox_smoke.py  # 14 项: /etc /root /proc / 越界 / 相对路径 / /tmp
 python sandbox-service/tests/admin_keys_smoke.py    # 11 项: admin 创建/撤销 + 数据面 key 拒绝在 admin 入口 (需要 ADMIN_TOKEN)
+python sandbox-service/tests/session_smoke.py       # 14 项: chat-session 隔离 — control plane 校验 + edge-proxy 校验 + 旧客户端兼容
 ```
 
 #### 4.13.5 Key 管理入口 (`/admin/keys`, P4 第五刀)
@@ -1070,6 +1071,57 @@ curl -X DELETE -H "X-Admin-Token: $ADMIN_TOKEN" http://host:8902/admin/keys/k_xx
 
 向后兼容:已有的 `API_KEYS_JSON` 环境变量 key 启动时被自动导入 `api_keys` 表(idempotent),之后通过 `/admin/keys` 接管。
 
+#### 4.13.6 Chat-Session 隔离 (`sessionId` + `X-Session-Id`, P4 第六刀)
+
+第四刀的隔离粒度是 **API Key (owner+tenant)** — 同一个 key 下不同 chat session 仍然共享沙箱。这一刀把粒度下推到 **会话级**：每个 chat session 独占一个 sandbox，文件 / 进程 / 网络栈彻底隔离；同一 session 内的多轮对话复用同一个 sandbox。
+
+**模型**：`Session = Sandbox`（E2B 官方语义），客户端拥有 `sessionId ↔ sandboxId` 映射。
+
+**三个改动点**：
+
+| 层 | 改动 | 作用 |
+|---|---|---|
+| `POST /sandboxes` | 接受 `sessionId` (或 `session_id`) | 创建沙箱时绑定会话；同 (owner, tenant, sessionId) 已存在 running/paused 沙箱 → 409 |
+| `GET /sandboxes/{sid}` 等所有生命周期端点 | 校验请求头 `X-Session-Id` | 绑定沙箱强制要求 header；不匹配 403；未绑定的 legacy 沙箱跳过 |
+| `GET /v2/sandboxes` | 当 `X-Session-Id` 存在时按会话过滤 | 只返回当前会话的沙箱；不带 header = admin 视图返回全部 |
+| edge-proxy (`{port}-{sid}.{domain}`) | 转发前查 `sandboxes.session_id` | 若绑定则要求 `X-Session-Id` 匹配，否则 403 直接返回，**根本不进容器** |
+
+**调用样式**：
+
+```bash
+# 1. 新会话开始:创建沙箱并绑定 sessionId
+curl -X POST http://host:8902/sandboxes \
+  -H "Authorization: Bearer $API_KEY" -H "Content-Type: application/json" \
+  -d '{"templateID":"code-interpreter","sessionId":"chat-A-7b3c9d"}'
+# → {"sandboxID":"sbx…","envdAccessToken":"…","sessionID":"chat-A-7b3c9d",…}
+
+# 2. 同一会话内的多轮对话:复用 sandbox,每次带 X-Session-Id
+curl http://host:8902/sandboxes/sbx…/health \
+  -H "Authorization: Bearer $API_KEY" -H "X-Session-Id: chat-A-7b3c9d"
+
+# 3. 数据面文件操作也要带 (edge-proxy 校验)
+curl https://49983-sbx….${DOMAIN}/files?path=/workspace/report.pdf \
+  -H "x-access-token: $ENVD_TOKEN" \
+  -H "X-Session-Id: chat-A-7b3c9d"
+
+# 4. 列出本会话的沙箱 (跨会话不可见)
+curl http://host:8902/v2/sandboxes \
+  -H "Authorization: Bearer $API_KEY" -H "X-Session-Id: chat-A-7b3c9d"
+```
+
+**Session ID 命名建议**：用对话平台已有的 UUID / 雪花 ID，加前缀便于排错（如 `chat-A-7b3c9d`、`web-thread-xxx`）。沙箱销毁后同一 `sessionId` 可重新绑定（`running|paused` 才视为占用）。
+
+**错误码**：
+
+| code | HTTP | 场景 |
+|---|---|---|
+| `100013` | 403 | 绑定沙箱缺 `X-Session-Id` / header 不匹配 |
+| `100015` | 409 | 同 (owner, tenant, sessionId) 已有 running/paused 沙箱 |
+
+**兼容性**：所有改动向后兼容。`session_id IS NULL` 的旧沙箱（包括本轮之前由 deploy_server 注册的 legacy 行）不受 session 校验影响；不带 `sessionId` 创建出来的新沙箱也是 legacy 行为。
+
+冒烟：[tests/session_smoke.py](sandbox-service/tests/session_smoke.py) 14 项（控制面 + edge-proxy + 重复绑定 + 撤销重绑 + legacy 兼容）。
+
 ---
 
 ## 5. 镜像矩阵
@@ -1106,6 +1158,7 @@ curl -X DELETE -H "X-Admin-Token: $ADMIN_TOKEN" http://host:8902/admin/keys/k_xx
 | **P4 Sandbox 归属** | `tests/ownership_smoke.py` | **跨 owner / tenant 访问 403 + list 过滤 + bad key 401 + 单 key 兼容（8 项）** |
 | **P4 路径沙箱** | `tests/path_sandbox_smoke.py` | **/workspace 允许 + /etc /root /proc / 越界 全部 403 + /tmp 允许 + ConnectRPC 路径校验（14 项）** |
 | **P4 Admin Keys** | `tests/admin_keys_smoke.py` | **ADMIN_TOKEN 鉴权 + 完整 key 仅一次返回 + 撤销立即生效 + 数据面 key 在 admin 入口被拒（11 项）** |
+| **P4 Chat-Session 隔离** | `tests/session_smoke.py` | **Session = Sandbox：create 绑 sessionId / dup 409 / 跨 session 403 / list 过滤 / edge-proxy 校验 / 撤销重绑 / legacy 兼容（14 项）** |
 
 运行：
 ```bash
@@ -1127,6 +1180,7 @@ python tests/metrics_smoke.py                # Prometheus 指标冒烟
 python tests/ownership_smoke.py             # 多租户归属 (需要 API_KEYS_JSON 三 key)
 python tests/path_sandbox_smoke.py          # 容器内 /workspace 路径沙箱
 python tests/admin_keys_smoke.py            # /admin/keys 管理入口 (需要 ADMIN_TOKEN)
+python tests/session_smoke.py               # chat-session 隔离 (Session = Sandbox)
 ```
 
 ---
