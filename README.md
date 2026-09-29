@@ -106,6 +106,8 @@ sbx.run_code("print(1+1)")
 
 ## 2. 架构
 
+![沙箱服务总体架构图](docs/diagrams/架构_总体架构流程图.png)
+
 ```
                           ┌────────────────────────────┐
    Claude Code/Cursor ───┤  MCP server (stdio, 本地)   │
@@ -850,6 +852,8 @@ python sandbox-service/tests/hook_smoke.py
 | 后续请求 | 都失败 | 走 fast path（容器已 running） |
 
 实现路径只有 ~10 行：
+
+![Ingress keepalive 实现路径流程图](docs/diagrams/keepalive实现路径_业务流程图.png)
 
 ```text
 client ──HTTPS──▶ edge proxy ──open_connection──▶ sandbox host_port

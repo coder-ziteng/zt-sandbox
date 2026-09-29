@@ -56,6 +56,32 @@
       ]
     },
     {
+      "file": "架构_总体架构流程图.png",
+      "type": "flow",
+      "title": "沙箱服务 · 总体架构",
+      "desc": "管控面/数据面分离；数据面每沙箱一个容器（--network=host）；E2B SDK 拿到 host+token 后直连 envd",
+      "rows": [
+        ["Claude Code / Cursor", "E2B SDK / curl"],
+        ["MCP server\nstdio, 本地"],
+        ["管控面 :8902\nFastAPI / SQLite", "edge-proxy :443\n子域路由"],
+        ["mini_envd\n:49983", "jupyter\n:49999", "chromium\n:3000"]
+      ]
+    },
+    {
+      "file": "keepalive实现路径_业务流程图.png",
+      "type": "flow",
+      "title": "Ingress keepalive · 实现路径",
+      "desc": "未拒绝则跳过 auto-resume 直接转发；首连约 1.5s（CRIU 还原），之后走 fast path",
+      "rows": [
+        ["客户端 HTTPS 请求 :443"],
+        ["edge-proxy open_connection\n127.0.0.1:hostPort"],
+        ["?ECONNREFUSED？"],
+        ["POST /internal/auto-resume\nresume + 重试一次"],
+        ["双向 pipe 透传"],
+        ["响应返回客户端"]
+      ]
+    },
+    {
       "file": "沙箱状态机_分组图.png",
       "type": "grouped",
       "title": "沙箱生命周期 · 状态机",
