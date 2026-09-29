@@ -7,9 +7,14 @@ services:
     # NET_ADMIN: required by the P2 network allowlist (iptables runs in the host netns)
     cap_add:
       - NET_ADMIN
+    # .env (deploy/.env) is the source of truth for these — populated by
+    # deploy_server.py from SBX_API_KEYS / SBX_API_KEYS_JSON / SBX_ADMIN_TOKEN.
+    env_file:
+      - .env
     environment:
       API_KEYS: "${API_KEYS:-}"
       API_KEYS_JSON: "${API_KEYS_JSON:-}"
+      ADMIN_TOKEN: "${ADMIN_TOKEN:-}"
       SANDBOX_DOMAIN: "${SANDBOX_DOMAIN:-192.168.2.162.nip.io}"
       CRIU_ENABLED: "${CRIU_ENABLED:-auto}"
       CHECKPOINT_DIR: "/var/lib/sbx-checkpoints"

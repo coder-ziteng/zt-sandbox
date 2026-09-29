@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import secrets
 import sys
 import tarfile
 import time
@@ -16,6 +17,12 @@ def _require(name):
     return val
 
 
+def _gen_admin_token() -> str:
+    tok = "adm_" + secrets.token_urlsafe(32)
+    print(f"[admin] generated ADMIN_TOKEN (store it now, will not be shown again): {tok}")
+    return tok
+
+
 HOST = _require("SBX_SSH_HOST")
 USER = _require("SBX_SSH_USER")
 PWD = _require("SBX_SSH_PASSWORD")
@@ -27,15 +34,21 @@ API_KEYS = _require("SBX_API_KEYS")
 E2B_KEY = os.environ.get("SBX_E2B_KEY", "")
 # Optional identity binding for multi-tenant isolation (P4).
 API_KEYS_JSON = os.environ.get("SBX_API_KEYS_JSON", "")
+# P4: separate admin credential for /admin/* (api key management). Distinct
+# from API_KEYS so a leaked data-plane key can never mint/revoke keys.
+ADMIN_TOKEN = os.environ.get("SBX_ADMIN_TOKEN", "") or _gen_admin_token()
 
 SKIP_DIRS = {".venv", "__pycache__", "data", "certs"}
 SKIP_FILES = {".gitignore"}
 
-# Write API_KEYS (+ optional e2b key + optional identity JSON) into .env
+# Write API_KEYS (+ optional e2b key + optional identity JSON + admin token)
+# into .env. ADMIN_TOKEN is always written; if the operator didn't supply one
+# we generate a long random one and print it once on stdout.
 api_keys_csv = API_KEYS + (f",{E2B_KEY}" if E2B_KEY else "")
 env_content = f"API_KEYS={api_keys_csv}\nSANDBOX_DOMAIN={DOMAIN}\n"
 if API_KEYS_JSON:
     env_content += f"API_KEYS_JSON={API_KEYS_JSON}\n"
+env_content += f"ADMIN_TOKEN={ADMIN_TOKEN}\n"
 EXTRA = {
     "deploy/.env": env_content,
 }

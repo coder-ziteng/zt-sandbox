@@ -22,6 +22,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 log = logging.getLogger("control-plane")
 
 API_KEYS = [k.strip() for k in os.getenv("API_KEYS", "").split(",") if k.strip()]
+# --- P4: separate admin credential for /admin/* — never accepted on data-plane
+# endpoints. Operators configure it via the ADMIN_TOKEN env var (long random
+# string); rotate by restarting the control plane with a new value.
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
 SANDBOX_DOMAIN = os.getenv("SANDBOX_DOMAIN", "192.168.2.162.nip.io")
 ENVD_VERSION = "0.7.0"
 MAX_SANDBOXES = int(os.getenv("MAX_SANDBOXES", "24"))
@@ -34,8 +38,15 @@ NETPOLICY_REFRESH_S = int(os.getenv("NETPOLICY_REFRESH_S", "300"))  # 5min
 # format avoids the quote-stripping pitfalls of writing JSON through docker
 # compose's env-file parser. When unset, every key gets (default, default) —
 # single-key legacy mode where sandbox ownership is not enforced.
+#
+# P4: admin-managed keys (api_keys table) take precedence at request time. At
+# startup we *preload* env keys into the DB so the env is the bootstrap source
+# of truth — once the operator uses /admin/keys to mint or revoke, the DB
+# becomes authoritative. Legacy env keys that already exist in the DB are
+# detected by (prefix,suffix) and re-attached to the row instead of duplicated.
 OWNER_MAP: dict[str, tuple[str, str]] = {}
 _key_json = os.getenv("API_KEYS_JSON", "").strip()
+_env_keys: list[tuple[str, str, str, str]] = []  # (plaintext, owner, tenant, label)
 if _key_json:
     try:
         for entry in _key_json.split(";"):
@@ -49,6 +60,7 @@ if _key_json:
             OWNER_MAP[k] = (owner, tenant)
             if k not in API_KEYS:
                 API_KEYS.append(k)
+            _env_keys.append((k, owner, tenant, "from-env"))
         # Keys in API_KEYS but absent from JSON still get (default, default)
         # for backward compatibility with legacy single-key deployments.
         for k in API_KEYS:
@@ -63,6 +75,31 @@ store.init_db()
 runtime.ensure_network()
 
 
+def _seed_env_keys_into_db():
+    """Bootstrap: copy legacy env-var keys into the api_keys table so the admin
+    interface can list/revoke them. Idempotent — re-running with the same env
+    leaves existing rows alone (matched by hash)."""
+    if not _env_keys:
+        return
+    for plain, owner, tenant, label in _env_keys:
+        h = store._hash_key(plain)
+        with store.db() as c:
+            existing = c.execute(
+                "SELECT id, revoked_at FROM api_keys WHERE key_hash=?", (h,)
+            ).fetchone()
+            if existing:
+                continue
+            kid = "k_" + plain[:8].replace("e2b_", "").replace("_", "")[:12] or "kenv"
+            c.execute(
+                "INSERT INTO api_keys (id,key_hash,prefix,suffix,owner,tenant,label,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
+                (kid, h, plain[:8], plain[-4:], owner, tenant, label, time.time()),
+            )
+
+
+_seed_env_keys_into_db()
+
+
 def err(code: int, message: str, status: int):
     rid = f"req-{int(time.time()*1000)}"
     return JSONResponse({"code": code, "message": message, "requestID": rid}, status_code=status)
@@ -71,6 +108,14 @@ def err(code: int, message: str, status: int):
 @app.middleware("http")
 async def auth(request: Request, call_next):
     path = request.url.path
+    if path.startswith("/admin"):
+        # /admin/* uses a separate credential — never the data-plane API key.
+        if not ADMIN_TOKEN:
+            return err(100012, "admin 未启用: 未设置 ADMIN_TOKEN", 503)
+        presented = request.headers.get("x-admin-token", "") or _bearer(request)
+        if not presented or presented != ADMIN_TOKEN:
+            return err(100012, "admin 凭证无效", 401)
+        return await call_next(request)
     if path in ("/health", "/metrics", "/") or path.startswith("/internal"):
         return await call_next(request)
     # Two credential styles are accepted:
@@ -80,11 +125,24 @@ async def auth(request: Request, call_next):
     token = authz[7:] if authz.lower().startswith("bearer ") else ""
     if not token:
         token = request.headers.get("x-api-key", "")
-    if token not in API_KEYS:
+    if not token:
         return err(100001, "API Key 无效", 401)
-    # Attach caller identity so downstream handlers can enforce ownership.
-    request.state.owner, request.state.tenant = OWNER_MAP.get(token, ("default", "default"))
-    return await call_next(request)
+    # P4: try DB-managed key (hashed) first — these override env keys at
+    # request time so admin revoke takes effect immediately.
+    identity = store.resolve_key(token)
+    if identity is not None:
+        request.state.owner, request.state.tenant = identity
+        return await call_next(request)
+    # Fall back to legacy env-var list (key is plaintext in the list).
+    if token in API_KEYS:
+        request.state.owner, request.state.tenant = OWNER_MAP.get(token, ("default", "default"))
+        return await call_next(request)
+    return err(100001, "API Key 无效", 401)
+
+
+def _bearer(request: Request) -> str:
+    authz = request.headers.get("authorization", "")
+    return authz[7:] if authz.lower().startswith("bearer ") else ""
 
 
 def caller_identity(request: Request) -> tuple[str, str]:
@@ -182,6 +240,48 @@ def prometheus_metrics():
     prometheus receiver)。无需鉴权 — 指标不含敏感信息。
     """
     return Response(content=metrics.render(), media_type=metrics.CONTENT_TYPE)
+
+
+# ---------------- /admin/* (P4 — credential management) ----------------
+# Separate credential (ADMIN_TOKEN) — API_KEYS are not accepted here on
+# purpose, so a leaked data-plane key can never mint new ones. Operators
+# should rotate ADMIN_TOKEN by restarting the control plane.
+
+@app.get("/admin/keys")
+def admin_list_keys(includeRevoked: bool = False):
+    return {"keys": store.list_api_keys(include_revoked=includeRevoked)}
+
+
+@app.post("/admin/keys")
+async def admin_create_key(request: Request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    owner = (body.get("owner") or "").strip()
+    tenant = (body.get("tenant") or "").strip()
+    label = (body.get("label") or "").strip()
+    if not owner or not tenant:
+        return err(100013, "owner/tenant 必填", 400)
+    meta, plaintext = store.generate_api_key(owner, tenant, label)
+    # Plaintext is returned ONCE — caller (operator) must store it. The list
+    # endpoint will never display it again; revocation means the plaintext is
+    # permanently dead, no recovery.
+    return JSONResponse(
+        {
+            "key": plaintext,
+            "meta": meta,
+            "warning": "完整 key 仅此一次返回。请立即保存到安全的地方,事后无法再读取。",
+        },
+        status_code=201,
+    )
+
+
+@app.delete("/admin/keys/{key_id}")
+def admin_revoke_key(key_id: str):
+    if not store.revoke_api_key(key_id):
+        return err(100014, f"key 不存在或已撤销: {key_id}", 404)
+    return {"id": key_id, "revoked": True}
 
 
 @app.post("/sandboxes")

@@ -2,7 +2,10 @@
 
 P1 additions: browser port + per-template browser flag.
 P2 additions: network policy per template, pause mode (criu|stop), quota accounting.
+P4 additions: api_keys table (admin-managed API credentials with revoke).
 """
+import hashlib
+import secrets as _secrets
 import json
 import sqlite3
 import threading
@@ -64,6 +67,25 @@ def _migrate(c):
         c.execute("ALTER TABLE sandboxes ADD COLUMN tenant TEXT NOT NULL DEFAULT 'default'")
 
 
+def _ensure_api_keys(c):
+    c.execute(
+        """
+        CREATE TABLE IF NOT EXISTS api_keys (
+            id TEXT PRIMARY KEY,
+            key_hash TEXT NOT NULL UNIQUE,
+            prefix TEXT NOT NULL,
+            suffix TEXT NOT NULL,
+            owner TEXT NOT NULL,
+            tenant TEXT NOT NULL,
+            label TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL,
+            revoked_at REAL,
+            last_used_at REAL NOT NULL DEFAULT 0
+        )
+        """
+    )
+
+
 def init_db():
     with db() as c:
         c.executescript(
@@ -107,6 +129,7 @@ def init_db():
             """
         )
         _migrate(c)
+        _ensure_api_keys(c)
 
 
 def new_id(prefix: str) -> str:
@@ -301,3 +324,103 @@ def committed_resources():
             "WHERE s.state IN ('running','paused')"
         ).fetchone()
     return {"count": row["n"], "cpu": row["cpu"], "memoryMB": row["mem"]}
+
+
+# ---------- api_keys (P4 admin-managed credentials) ----------
+
+def _hash_key(key: str) -> str:
+    return hashlib.sha256(key.encode()).hexdigest()
+
+
+def generate_api_key(owner: str, tenant: str, label: str = "") -> tuple[dict, str]:
+    """Mint a new key. Returns (row_dict_without_secret, plaintext_key).
+
+    The plaintext key is returned ONCE — store it now, we never store it.
+    Caller must surface it to the operator immediately.
+    """
+    raw = _secrets.token_urlsafe(32)
+    key_id = "k_" + uuid.uuid4().hex[:12]
+    full_key = f"e2b_{key_id}_{raw}"
+    with db() as c:
+        c.execute(
+            "INSERT INTO api_keys (id,key_hash,prefix,suffix,owner,tenant,label,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?)",
+            (key_id, _hash_key(full_key), full_key[:8], full_key[-4:],
+             owner, tenant, label, time.time()),
+        )
+    row = {
+        "id": key_id,
+        "prefix": full_key[:8],
+        "suffix": full_key[-4:],
+        "owner": owner,
+        "tenant": tenant,
+        "label": label,
+        "createdAt": int(time.time()),
+        "revokedAt": None,
+        "lastUsedAt": 0,
+    }
+    return row, full_key
+
+
+def list_api_keys(include_revoked: bool = False) -> list[dict]:
+    with db() as c:
+        sql = "SELECT id,prefix,suffix,owner,tenant,label,created_at,revoked_at,last_used_at FROM api_keys"
+        if not include_revoked:
+            sql += " WHERE revoked_at IS NULL"
+        sql += " ORDER BY created_at DESC"
+        rows = c.execute(sql, []).fetchall()
+    return [
+        {
+            "id": r["id"],
+            "prefix": r["prefix"],
+            "suffix": r["suffix"],
+            "owner": r["owner"],
+            "tenant": r["tenant"],
+            "label": r["label"],
+            "createdAt": int(r["created_at"]),
+            "revokedAt": int(r["revoked_at"]) if r["revoked_at"] else None,
+            "lastUsedAt": int(r["last_used_at"]),
+            "displayKey": f"{r['prefix']}…{r['suffix']}",
+        }
+        for r in rows
+    ]
+
+
+def revoke_api_key(key_id: str) -> bool:
+    with db() as c:
+        cur = c.execute(
+            "UPDATE api_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL",
+            (time.time(), key_id),
+        )
+    return cur.rowcount > 0
+
+
+def active_key_identities() -> list[tuple[str, str, str]]:
+    """For control-plane bootstrap: returns (key_id, owner, tenant) for every
+    non-revoked key. The plaintext key is NOT stored, only its id (which is the
+    stable prefix we hand out to operators). Auth at request time uses
+    resolve_key() to verify the presented plaintext against the stored hash.
+    """
+    with db() as c:
+        rows = c.execute(
+            "SELECT id, owner, tenant FROM api_keys WHERE revoked_at IS NULL"
+        ).fetchall()
+    return [(r["id"], r["owner"], r["tenant"]) for r in rows]
+
+
+def resolve_key(plaintext: str) -> tuple[str, str] | None:
+    """Hash lookup. Returns (owner, tenant) on match, None otherwise.
+
+    Updates last_used_at as a side effect (best-effort; not gated on the lookup
+    outcome so a flooded bad-key stream doesn't trash the table).
+    """
+    h = _hash_key(plaintext)
+    with db() as c:
+        row = c.execute(
+            "SELECT id, owner, tenant FROM api_keys WHERE key_hash=? AND revoked_at IS NULL",
+            (h,),
+        ).fetchone()
+        if row:
+            c.execute("UPDATE api_keys SET last_used_at=? WHERE id=?", (time.time(), row["id"]))
+            return row["owner"], row["tenant"]
+    return None

@@ -1032,7 +1032,43 @@ chown -R user:user /workspace 2>/dev/null || true
 # 启动管控面时设 API_KEYS_JSON (见 .env.example)
 python sandbox-service/tests/ownership_smoke.py     # 8 项: 跨 owner/tenant 全部 403
 python sandbox-service/tests/path_sandbox_smoke.py  # 14 项: /etc /root /proc / 越界 / 相对路径 / /tmp
+python sandbox-service/tests/admin_keys_smoke.py    # 11 项: admin 创建/撤销 + 数据面 key 拒绝在 admin 入口 (需要 ADMIN_TOKEN)
 ```
+
+#### 4.13.5 Key 管理入口 (`/admin/keys`, P4 第五刀)
+
+API Key 本身是「一次性 mint 之后无法再读」的秘密,绝不能通过普通数据面 API 直接查询 — 否则任何持有 API Key 的第三方就能枚举出其他所有人的 key。所以 **key 的生命周期管理走专用入口**:
+
+| 端点 | 方法 | 凭据 | 作用 |
+|---|---|---|---|
+| `/admin/keys` | GET | `X-Admin-Token` | 列出当前 active keys,**只回显** `prefix…suffix` + 元数据 |
+| `/admin/keys` | POST | `X-Admin-Token` | 创建新 key。**完整 plaintext 仅此一次返回**;之后 list 永远看不到 |
+| `/admin/keys/{id}` | DELETE | `X-Admin-Token` | 立即撤销 — 下次请求即 401 |
+
+凭据 (`ADMIN_TOKEN`) 与 `API_KEYS` 完全隔离 — 数据面 key 在 `/admin/*` 上**显式被拒**(401, 不是 403),即使数据面 key 泄漏也无法用来 mint/revoke。
+
+启动:
+
+```bash
+# .env (或 docker-compose env):
+ADMIN_TOKEN=adm_xxx...          # 留空时 deploy_server.py 自动生成并打印一次
+
+# 列表 (看不到完整 key,只看前缀+后缀):
+curl -H "X-Admin-Token: $ADMIN_TOKEN" http://host:8902/admin/keys
+
+# 创建 (会拿到完整 plaintext,必须立即保存):
+curl -X POST -H "X-Admin-Token: $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"owner":"alice","tenant":"acme","label":"prod-bot"}' \
+  http://host:8902/admin/keys
+# → {"key":"e2b_k_..._...","meta":{...},"warning":"完整 key 仅此一次返回..."}
+
+# 撤销:
+curl -X DELETE -H "X-Admin-Token: $ADMIN_TOKEN" http://host:8902/admin/keys/k_xxxxxxxx
+```
+
+底层存 `api_keys` 表 (`id, key_hash(SHA-256), prefix, suffix, owner, tenant, label, created_at, revoked_at, last_used_at`)。**明文 key 不入库** — 撤销等同于永久销毁,无法再找回。
+
+向后兼容:已有的 `API_KEYS_JSON` 环境变量 key 启动时被自动导入 `api_keys` 表(idempotent),之后通过 `/admin/keys` 接管。
 
 ---
 
@@ -1069,6 +1105,7 @@ python sandbox-service/tests/path_sandbox_smoke.py  # 14 项: /etc /root /proc /
 | **P3 Prometheus Metrics** | `tests/metrics_smoke.py` | **/metrics 端点 + 指标族 + 归一化 + 生命周期计数器（7 项）** |
 | **P4 Sandbox 归属** | `tests/ownership_smoke.py` | **跨 owner / tenant 访问 403 + list 过滤 + bad key 401 + 单 key 兼容（8 项）** |
 | **P4 路径沙箱** | `tests/path_sandbox_smoke.py` | **/workspace 允许 + /etc /root /proc / 越界 全部 403 + /tmp 允许 + ConnectRPC 路径校验（14 项）** |
+| **P4 Admin Keys** | `tests/admin_keys_smoke.py` | **ADMIN_TOKEN 鉴权 + 完整 key 仅一次返回 + 撤销立即生效 + 数据面 key 在 admin 入口被拒（11 项）** |
 
 运行：
 ```bash
@@ -1089,6 +1126,7 @@ python tests/diag_smoke.py                    # 沙箱诊断快照
 python tests/metrics_smoke.py                # Prometheus 指标冒烟
 python tests/ownership_smoke.py             # 多租户归属 (需要 API_KEYS_JSON 三 key)
 python tests/path_sandbox_smoke.py          # 容器内 /workspace 路径沙箱
+python tests/admin_keys_smoke.py            # /admin/keys 管理入口 (需要 ADMIN_TOKEN)
 ```
 
 ---
